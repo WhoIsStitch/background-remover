@@ -10,6 +10,8 @@ Static site on GitHub Pages (repo WhoIsStitch/background-remover, branch main, r
   - Tried and rejected (worse on tests): Gaussian mixture models, 32-level histograms, edge-trace background hint.
   - watershed (bucket queue), applyStrokes, regionAt (Select tool), shrinkEdge, unmixEdges
 - `maxflow.js`: Boykov–Kolmogorov max-flow on a 4-connected grid (verified against Edmonds–Karp on 300 random grids).
+- `effects.js`: applyEffects (outline via exact distance transform, colour/blur background, crop to content).
+- `zip.js`: store-only ZIP writer for batch downloads.
 - `png.js`: lossless RGBA PNG encoder (uses CompressionStream)
 
 Rules: never resize the image; never change RGB of fully opaque pixels; save via `encodePNG`, not canvas.toBlob.

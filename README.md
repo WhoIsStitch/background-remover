@@ -24,6 +24,17 @@ A fast background remover that runs entirely in your browser. No AI and no uploa
 - **Trim edge:** shaves 1–4 px off the outline to remove fringes.
 - **Shortcuts:** Ctrl+Z undoes; hold Space to compare with the original.
 
+## Background & effects
+- **Background:** keep it transparent, fill a colour, or use a blurred copy of the original ("portrait mode").
+- **Outline:** a sticker-style outline, 1–40 px, in any colour.
+- **Crop to subject:** trims the image to the subject, with padding you choose.
+- **Copy:** copies the result to the clipboard.
+
+## Batch
+Drop or choose several images at once. Each one is cut automatically with your current effect settings. Click any image to fine-tune it, or download them all as a ZIP.
+
+Mouse wheel zooms around the cursor.
+
 Every step ends with **edge un-mixing**: each boundary pixel is split into subject and local background, so there's no halo on a new background.
 
 ## Run locally

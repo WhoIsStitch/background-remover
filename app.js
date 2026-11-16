@@ -3,6 +3,8 @@ import {
   regionAt, applyStrokes, shrinkEdge, unmixEdges,
 } from './imaging.js';
 import { encodePNG } from './png.js';
+import { applyEffects } from './effects.js';
+import { makeZip } from './zip.js';
 
 const $ = (id) => document.getElementById(id);
 const view = $('view');
@@ -31,7 +33,8 @@ const state = {
   // {kind:'box', rect} | {kind:'wand', i, keep, tol, contiguous} | {kind:'stroke', type, r, pts}
   actions: [],
   tool: 'select', drawing: null, boxDrag: null, hover: null,
-  zoomed: false, showingOriginal: false, job: 0,
+  zoomed: false, scale: null, showingOriginal: false, job: 0,
+  previewImage: null, fxBg: 'none',
 };
 
 // ---------- Loading ----------
@@ -39,6 +42,7 @@ async function loadFile(file) {
   if (!file || !file.type.startsWith('image/')) { toastError('That file is not an image.'); return; }
   showBusy('Opening image…');
   $('drop').hidden = true;
+  $('batch').hidden = true;
   $('work').hidden = false;
   try {
     const bmp = await createImageBitmap(file);
@@ -51,7 +55,7 @@ async function loadFile(file) {
     Object.assign(state, {
       file, w, h, src: state.srcImage.data,
       name: (file.name || 'image').replace(/\.[^.]+$/, ''),
-      actions: [], resultImage: null, zoomed: false, base: null, baseKey: '', hover: null,
+      actions: [], resultImage: null, previewImage: null, zoomed: false, scale: null, base: null, baseKey: '', hover: null,
     });
     state.bg = detectBackground(state.src, w, h);
     view.width = marksCanvas.width = hlCanvas.width = w;
@@ -108,9 +112,10 @@ async function run() {
   compose(p);
   const ms = Math.round(performance.now() - t0);
   hideBusy();
-  render();
+  refreshPreview();
   updatePanel(p);
   $('download').disabled = false;
+  $('copy').disabled = false;
   $('info').textContent = `${state.w} × ${state.h}px · ${ms < 1000 ? ms + ' ms' : (ms / 1000).toFixed(1) + ' s'}`;
 }
 
@@ -222,8 +227,38 @@ function rasterStroke(marks, w, h, s) {
 
 // ---------- Display ----------
 function render() {
-  const img = state.showingOriginal ? state.srcImage : state.resultImage;
+  const img = state.showingOriginal ? state.srcImage : state.previewImage || state.resultImage;
   if (img) ctx.putImageData(img, 0, 0);
+}
+
+// ---------- Background & effects ----------
+function hexRGB(hex) { return [1, 3, 5].map((k) => parseInt(hex.slice(k, k + 2), 16)); }
+function fxSettings(withCrop) {
+  return {
+    bg: state.fxBg,
+    bgColor: hexRGB($('bgColor').value),
+    outline: { width: +$('outline').value, color: hexRGB($('outlineColor').value) },
+    crop: { on: withCrop && $('crop').checked, pad: +$('pad').value },
+  };
+}
+function fxActive() { return state.fxBg !== 'none' || +$('outline').value > 0; }
+
+// Preview shows effects at full size; cropping happens on export.
+function refreshPreview() {
+  state.previewImage = null;
+  if (state.resultImage && fxActive()) {
+    const r = applyEffects(state.resultImage.data, state.w, state.h, state.src, fxSettings(false));
+    state.previewImage = new ImageData(r.data, r.w, r.h);
+  }
+  $('outlineVal').textContent = +$('outline').value ? $('outline').value + ' px' : 'off';
+  $('padVal').textContent = $('pad').value + ' px';
+  $('bgColorRow').hidden = state.fxBg !== 'color';
+  render();
+}
+
+async function exportBlob() {
+  const r = applyEffects(state.resultImage.data, state.w, state.h, state.src, fxSettings(true));
+  return encodePNG(r.data, r.w, r.h);
 }
 
 function drawMarks() {
@@ -292,7 +327,9 @@ function drawHover(i, keep) {
 function fit() {
   if (!state.w) return;
   let cw, ch;
-  if (state.zoomed) {
+  if (state.scale) {
+    cw = state.w * state.scale; ch = state.h * state.scale;
+  } else if (state.zoomed) {
     const dpr = window.devicePixelRatio || 1;
     cw = state.w / dpr; ch = state.h / dpr;
   } else {
@@ -369,15 +406,14 @@ function toastError(msg) {
 $('pick').addEventListener('click', (e) => { e.stopPropagation(); $('file').click(); });
 $('drop').addEventListener('click', () => $('file').click());
 $('drop').addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('file').click(); } });
-$('file').addEventListener('change', (e) => loadFile(e.target.files[0]));
+$('file').addEventListener('change', (e) => loadFiles(e.target.files));
 
 window.addEventListener('dragover', (e) => { e.preventDefault(); $('drop').classList.add('over'); });
 window.addEventListener('dragleave', (e) => { if (!e.relatedTarget) $('drop').classList.remove('over'); });
 window.addEventListener('drop', (e) => {
   e.preventDefault();
   $('drop').classList.remove('over');
-  const f = [...e.dataTransfer.files].find((f) => f.type.startsWith('image/'));
-  if (f) loadFile(f);
+  loadFiles(e.dataTransfer.files);
 });
 window.addEventListener('paste', (e) => {
   const item = [...(e.clipboardData?.items || [])].find((i) => i.type.startsWith('image/'));
@@ -524,7 +560,8 @@ window.addEventListener('keydown', (e) => {
 window.addEventListener('keyup', (e) => { if (e.code === 'Space') setOriginal(false); });
 
 $('zoom').addEventListener('click', () => {
-  state.zoomed = !state.zoomed;
+  state.zoomed = state.scale ? false : !state.zoomed;
+  state.scale = null;
   stage.classList.toggle('zoomed', state.zoomed);
   $('zoom').textContent = state.zoomed ? 'Fit' : '100%';
   fit();
@@ -543,7 +580,7 @@ $('download').addEventListener('click', async () => {
   btn.disabled = true;
   btn.textContent = 'Saving…';
   try {
-    const blob = await encodePNG(state.resultImage.data, state.w, state.h);
+    const blob = await exportBlob();
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = `${state.name}-no-bg.png`;
@@ -558,3 +595,128 @@ $('download').addEventListener('click', async () => {
   }
 });
 $('another').addEventListener('click', reset);
+
+$('copy').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': exportBlob() })]);
+    $('copy').textContent = 'Copied!';
+  } catch (err) {
+    console.error(err);
+    toastError('Your browser blocked copying. Use Download instead.');
+  }
+  setTimeout(() => { $('copy').textContent = 'Copy'; }, 1500);
+});
+
+// Effects controls
+$('fxBg').addEventListener('click', (e) => {
+  const v = e.target.closest('button')?.dataset.fxbg;
+  if (!v) return;
+  state.fxBg = v;
+  for (const b of $('fxBg').children) b.setAttribute('aria-checked', String(b.dataset.fxbg === v));
+  refreshPreview();
+});
+let fxTimer;
+for (const id of ['bgColor', 'outline', 'outlineColor', 'crop', 'pad']) {
+  $(id).addEventListener('input', () => { clearTimeout(fxTimer); fxTimer = setTimeout(refreshPreview, 60); });
+}
+
+// Mouse-wheel zoom around the cursor.
+stage.addEventListener('wheel', (e) => {
+  if (!state.w || $('work').hidden) return;
+  e.preventDefault();
+  const r = wrap.getBoundingClientRect();
+  const fx = (e.clientX - r.left) / r.width, fy = (e.clientY - r.top) / r.height;
+  const cur = r.width / state.w;
+  const next = Math.min(16, Math.max(0.05, cur * (e.deltaY < 0 ? 1.2 : 1 / 1.2)));
+  state.scale = next;
+  stage.classList.add('zoomed');
+  fit();
+  const r2 = wrap.getBoundingClientRect();
+  stage.scrollLeft += r2.left + fx * r2.width - e.clientX;
+  stage.scrollTop += r2.top + fy * r2.height - e.clientY;
+  $('zoom').textContent = Math.round(next * (window.devicePixelRatio || 1) * 100) + '% · Fit';
+}, { passive: false });
+
+// ---------- Batch ----------
+function loadFiles(files) {
+  const imgs = [...files].filter((f) => f.type.startsWith('image/'));
+  if (imgs.length > 1) runBatch(imgs);
+  else if (imgs.length) loadFile(imgs[0]);
+}
+
+// Automatic cut for batch: same methods as Auto, no touch-ups.
+function autoCut(src, w, h) {
+  const n = w * h, tol = 36;
+  const bg = detectBackground(src, w, h);
+  const out = new Uint8ClampedArray(src), alpha = new Uint8Array(n);
+  for (let i = 0; i < n; i++) alpha[i] = src[i * 4 + 3];
+  if (bg.uniformity >= 0.8) {
+    const isBg = new Uint8Array(n), ref = new Float32Array(n * 3);
+    floodRegion(src, w, h, backgroundSeeds(src, w, h, bg.color, tol), tol, isBg, ref);
+    const info = findGaps(src, w, h, isBg);
+    if (info.gaps.length) floodRegion(src, w, h, info.gaps.map((g) => g.seed), tol, isBg, ref);
+    unmixEdges(src, out, alpha, w, h, isBg, ref, tol);
+  } else {
+    const mx = Math.max(2, Math.round(w * 0.02)), my = Math.max(2, Math.round(h * 0.02));
+    const isBg = grabCut(src, w, h, { box: [mx, my, w - mx, h - my], hard: false });
+    matteEdges(src, out, alpha, w, h, isBg, 2);
+  }
+  for (let i = 0; i < n; i++) out[i * 4 + 3] = alpha[i];
+  return out;
+}
+
+let batchItems = [];
+async function runBatch(files) {
+  state.job++;
+  for (const it of batchItems) URL.revokeObjectURL(it.url);
+  batchItems = [];
+  $('drop').hidden = true; $('work').hidden = true; $('batch').hidden = false;
+  $('zipBtn').disabled = true;
+  const grid = $('batchGrid');
+  grid.textContent = '';
+  const fx = fxSettings(true);
+  for (let k = 0; k < files.length; k++) {
+    const file = files[k];
+    $('batchInfo').textContent = `Cutting ${k + 1} of ${files.length}…`;
+    const el = document.createElement('div');
+    el.className = 'batch-item';
+    el.innerHTML = '<img alt=""><span></span>';
+    el.querySelector('span').textContent = file.name;
+    el.addEventListener('click', () => { $('batch').hidden = true; loadFile(file); });
+    grid.append(el);
+    await nextFrame();
+    try {
+      const bmp = await createImageBitmap(file);
+      const c = new OffscreenCanvas(bmp.width, bmp.height);
+      const cx = c.getContext('2d', { willReadFrequently: true });
+      cx.drawImage(bmp, 0, 0);
+      const src = cx.getImageData(0, 0, bmp.width, bmp.height).data;
+      const cut = autoCut(src, bmp.width, bmp.height);
+      const r = applyEffects(cut, bmp.width, bmp.height, src, fx);
+      const blob = await encodePNG(r.data, r.w, r.h);
+      const url = URL.createObjectURL(blob);
+      el.querySelector('img').src = url;
+      batchItems.push({ name: file.name.replace(/\.[^.]+$/, '') + '-no-bg.png', blob, url });
+    } catch (err) {
+      console.error(err);
+      el.querySelector('span').textContent = file.name + ' (failed)';
+    }
+  }
+  $('batchInfo').textContent = `${batchItems.length} of ${files.length} done`;
+  $('zipBtn').disabled = !batchItems.length;
+}
+$('zipBtn').addEventListener('click', async () => {
+  // Make names unique inside the ZIP.
+  const seen = new Map();
+  const files = batchItems.map((it) => {
+    const c = seen.get(it.name) || 0; seen.set(it.name, c + 1);
+    return { name: c ? it.name.replace(/\.png$/, `-${c}.png`) : it.name, blob: it.blob };
+  });
+  const zip = await makeZip(files);
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(zip);
+  a.download = 'no-bg-images.zip';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+});
+$('batchClose').addEventListener('click', () => { $('batch').hidden = true; $('drop').hidden = false; });

@@ -17,7 +17,7 @@
   <main>
     <!-- Empty state -->
     <section id="drop" class="drop" tabindex="0" aria-label="Choose an image">
-      <input id="file" type="file" accept="image/*" hidden>
+      <input id="file" type="file" accept="image/*" multiple hidden>
       <div class="drop-inner">
         <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
         <h1>Drop an image here</h1>
@@ -28,6 +28,19 @@
           <li>Runs in your browser — no upload</li>
         </ul>
       </div>
+    </section>
+
+    <!-- Batch state -->
+    <section id="batch" class="batch" hidden>
+      <div class="row batch-bar">
+        <strong id="batchTitle">Batch</strong>
+        <span id="batchInfo" class="muted"></span>
+        <div class="spacer"></div>
+        <button id="zipBtn" class="btn primary" disabled>Download all (ZIP)</button>
+        <button id="batchClose" class="btn">Done</button>
+      </div>
+      <p class="hint">Each image is cut automatically with your current Background &amp; effects settings. Click one to fine-tune it.</p>
+      <div id="batchGrid" class="batch-grid"></div>
     </section>
 
     <!-- Work state -->
@@ -105,9 +118,27 @@
           </div>
         </div>
 
+        <details class="group" id="fxBox">
+          <summary class="label">Background &amp; effects</summary>
+          <div class="seg small" id="fxBg">
+            <button data-fxbg="none" aria-checked="true">None</button>
+            <button data-fxbg="color" aria-checked="false">Colour</button>
+            <button data-fxbg="blur" aria-checked="false">Blur</button>
+          </div>
+          <label class="check" id="bgColorRow" hidden>Colour <input type="color" id="bgColor" value="#ffffff"></label>
+          <label class="label" for="outline">Outline <span id="outlineVal" class="muted"></span></label>
+          <div class="row"><input type="range" id="outline" min="0" max="40" value="0"><input type="color" id="outlineColor" value="#ffffff"></div>
+          <label class="check"><input type="checkbox" id="crop"> Crop to subject</label>
+          <label class="label" for="pad">Crop padding <span id="padVal" class="muted"></span></label>
+          <input type="range" id="pad" min="0" max="200" value="20">
+        </details>
+
         <div class="actions">
           <button id="download" class="btn primary" disabled>Download PNG</button>
-          <button id="another" class="btn">New image</button>
+          <div class="row">
+            <button id="copy" class="btn" disabled style="flex:1">Copy</button>
+            <button id="another" class="btn" style="flex:1">New image</button>
+          </div>
         </div>
       </aside>
     </section>
