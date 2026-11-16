@@ -34,7 +34,10 @@
     <section id="work" class="work" hidden>
       <div class="stage-wrap">
         <div id="stage" class="stage bg-checker">
-          <canvas id="view"></canvas>
+          <div id="canvasWrap" class="canvas-wrap">
+            <canvas id="view"></canvas>
+            <canvas id="marks"></canvas>
+          </div>
           <div id="busy" class="busy" hidden><div class="spinner"></div><span id="busyText">Working…</span></div>
         </div>
         <div class="stage-bar">
@@ -57,10 +60,23 @@
         <div class="group">
           <label class="label" for="tol">Tolerance <span id="tolVal" class="muted"></span></label>
           <input type="range" id="tol" min="4" max="120" value="36">
-          <p class="hint">Click any leftover background on the image to remove it.</p>
+        </div>
+
+        <div class="group">
+          <label class="label">Touch up</label>
+          <div class="seg small" id="tools" role="radiogroup">
+            <button role="radio" data-tool="click" aria-checked="true">Click</button>
+            <button role="radio" data-tool="keep" aria-checked="false"><span class="dot keep"></span>Keep</button>
+            <button role="radio" data-tool="remove" aria-checked="false"><span class="dot remove"></span>Remove</button>
+          </div>
+          <p id="toolHint" class="hint"></p>
+          <div id="brushRow" class="group" hidden>
+            <label class="label" for="brush">Brush size <span id="brushVal" class="muted"></span></label>
+            <input type="range" id="brush" min="2" max="80" value="16">
+          </div>
           <div class="row">
-            <button id="undo" class="btn" disabled>Undo click</button>
-            <button id="reset" class="btn" disabled>Clear clicks</button>
+            <button id="undo" class="btn" disabled>Undo</button>
+            <button id="reset" class="btn" disabled>Clear all</button>
           </div>
         </div>
 
@@ -83,7 +99,7 @@
   </main>
 
   <footer class="foot muted">
-    No AI, no upload. The cut tracks the background colour across the image and un-mixes the edges, at full resolution.
+    No AI, no upload. Background tracking, enclosed-gap detection and a marker watershed for the brushes, all at full resolution.
   </footer>
 
   <script type="module" src="app.js"></script>

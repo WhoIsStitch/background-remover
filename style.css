@@ -71,8 +71,14 @@ kbd { font: 12px ui-monospace, monospace; border: 1px solid var(--line); border-
   border: 1px solid var(--line); display: grid; place-items: center;
 }
 .stage.zoomed { place-items: start; }
-.stage canvas { display: block; cursor: crosshair; image-rendering: auto; }
+.canvas-wrap { position: relative; cursor: crosshair; touch-action: none; }
+.canvas-wrap canvas { display: block; width: 100%; height: 100%; image-rendering: auto; }
+.canvas-wrap #marks { position: absolute; inset: 0; pointer-events: none; }
+.canvas-wrap.hide-marks #marks { visibility: hidden; }
 .stage.zoomed canvas { image-rendering: pixelated; }
+.dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: 0; }
+.dot.keep { background: #22c55e; }
+.dot.remove { background: #ef4444; }
 .bg-checker { background-color: var(--check-a);
   background-image: conic-gradient(var(--check-b) 25%, transparent 0 50%, var(--check-b) 0 75%, transparent 0);
   background-size: 20px 20px; }

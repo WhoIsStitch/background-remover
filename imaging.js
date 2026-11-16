@@ -1,6 +1,15 @@
 // Image maths. Everything works on the full-resolution pixels; nothing is resized.
+//
+// Pipeline (see app.js compose()):
+//   1. floodRegion  – track the background in from the image edges
+//   2. findGaps     – enclosed patches of background colour (+ user clicks)
+//   3. applyStrokes – optional Keep/Remove brush marks, solved with a
+//                     marker-controlled watershed along the strongest edges
+//   4. unmixEdges   – soft, halo-free edges on the final boundary
 
-// Find the most common colour around the image border and how much of the
+// ---------- Background colour ----------
+
+// The most common colour around the image border and how much of the
 // border it covers (0..1).
 export function detectBackground(px, w, h) {
   const idx = borderIndices(w, h);
@@ -36,31 +45,26 @@ function dist2(px, o, c) {
 }
 
 // Border pixels that look like the background: where the cut starts from.
-// Pixels of the subject that touch the edge of the image are not used.
+// Parts of the subject that touch the edge of the image are not used.
 export function backgroundSeeds(px, w, h, bg, tol) {
   const lim = Math.max(30, tol * 1.5) ** 2;
   return borderIndices(w, h).filter((i) => px[i * 4 + 3] < 16 || dist2(px, i * 4, bg) <= lim);
 }
 
-// Remove the background, starting from `seeds`, by *tracking* it:
-// the flood carries an estimate of the local background colour that slowly
+// ---------- 1. Background tracking ----------
+
+// Mark background reachable from `seeds` in `isBg`, recording the tracked
+// background colour per pixel in `ref` (3 floats per pixel).
+// The flood carries an estimate of the local background colour that slowly
 // adapts as it spreads, so gradients, vignettes, soft shadows and uneven
-// scans are followed, while any sudden change (an outline, the subject's
-// edge) stops it.
-//
-// Then every pixel on the border between removed and kept areas is
-// "un-mixed": we estimate how much of it is subject and how much is the
-// local background, give it matching transparency, and take the background
-// colour out of it, so there is no halo.
-//
-// Every other kept pixel keeps its exact original value.
-// Writes into `out` (RGBA) and lowers `alpha` (one byte per pixel).
-export function floodCut(src, out, alpha, w, h, seeds, tol) {
+// scans are followed, while a sudden change (an outline, the subject's edge)
+// stops it. The estimate only adapts on smooth pixels, so it can never creep
+// along the soft rim of an outline.
+export function floodRegion(src, w, h, seeds, tol, isBg, ref) {
   const n = w * h;
   const tol2 = tol * tol;
-  const RATE = 0.25; // how quickly the tracked background colour adapts
-  const isBg = new Uint8Array(n);
-  const ref = new Float32Array(n * 3); // tracked background colour per removed pixel
+  const RATE = 0.25;
+  const edge2 = Math.max(12, tol * 0.6) ** 2;
   const queue = new Int32Array(n);
   let head = 0, tail = 0;
 
@@ -71,10 +75,6 @@ export function floodCut(src, out, alpha, w, h, seeds, tol) {
     queue[tail++] = s;
   }
 
-  // A pixel is "smooth" when it differs only a little from its neighbours.
-  // The tracked colour only adapts on smooth pixels, so it can follow a
-  // gradient but can never creep along the soft rim of an outline.
-  const edge2 = Math.max(12, tol * 0.6) ** 2;
   const far = (o, q) => {
     const d0 = src[q] - src[o], d1 = src[q + 1] - src[o + 1], d2 = src[q + 2] - src[o + 2];
     return d0 * d0 + d1 * d1 + d2 * d2 > edge2;
@@ -91,9 +91,8 @@ export function floodCut(src, out, alpha, w, h, seeds, tol) {
   const visit = (j, r0, r1, r2) => {
     if (isBg[j]) return;
     const o = j * 4;
-    const c0 = src[o], c1 = src[o + 1], c2 = src[o + 2];
     if (src[o + 3] >= 16) {
-      const d0 = c0 - r0, d1 = c1 - r1, d2 = c2 - r2;
+      const d0 = src[o] - r0, d1 = src[o + 1] - r1, d2 = src[o + 2] - r2;
       if (d0 * d0 + d1 * d1 + d2 * d2 > tol2) return;
       if (smooth(j, o)) { r0 += d0 * RATE; r1 += d1 * RATE; r2 += d2 * RATE; }
     }
@@ -102,7 +101,6 @@ export function floodCut(src, out, alpha, w, h, seeds, tol) {
     queue[tail++] = j;
   };
 
-  // Breadth-first, so the background estimate spreads out evenly.
   while (head < tail) {
     const i = queue[head++];
     const r0 = ref[i * 3], r1 = ref[i * 3 + 1], r2 = ref[i * 3 + 2];
@@ -112,7 +110,125 @@ export function floodCut(src, out, alpha, w, h, seeds, tol) {
     if (i >= w) visit(i - w, r0, r1, r2);
     if (i < n - w) visit(i + w, r0, r1, r2);
   }
+}
 
+// ---------- 2. Enclosed gaps ----------
+
+// Patches of background fully enclosed by the subject (e.g. the space between
+// an arm and the body, or a sliver between strands of hair).
+// We record the exact colours found in the open background (away from any
+// edge), then look for connected patches made of exactly those colours that
+// are either big, or long and thin. Exact matching matters: pale skin like
+// (255,253,252) must not count as a white background. Small patches, like eye
+// whites and highlights, are left alone.
+// Returns { label: Int32Array (pixel -> patch id), gaps: [{ id, seed, area }] }.
+export function findGaps(src, w, h, isBg) {
+  const n = w * h;
+  const rgb = (o) => (src[o] << 16) | (src[o + 1] << 8) | src[o + 2];
+  const seen = new Uint8Array(1 << 24); // how often each exact colour appears in open background
+  let any = false;
+  for (let i = w; i < n - w; i++) {
+    const x = i % w;
+    if (x === 0 || x === w - 1) continue;
+    if (!isBg[i] || !isBg[i - 1] || !isBg[i + 1] || !isBg[i - w] || !isBg[i + w] || src[i * 4 + 3] < 16) continue;
+    const c = rgb(i * 4);
+    if (seen[c] < 255) seen[c]++;
+    any = true;
+  }
+  if (!any) return { label: new Int32Array(n), gaps: [] };
+
+  const bigArea = Math.max(200, n * 0.0008);   // ~1800px on a 1500×1500 image
+  const thinArea = Math.max(100, n * 0.0004);  // ~900px: bigger than an eye white
+  const label = new Int32Array(n);
+  const stack = new Int32Array(n);
+  const gaps = [];
+  const match = (i) => !isBg[i] && seen[rgb(i * 4)] >= 3;
+  let id = 0;
+  for (let s = 0; s < n; s++) {
+    if (label[s] || !match(s)) continue;
+    id++;
+    let sp = 0, area = 0, seed = -1;
+    let x0 = w, x1 = 0, y0 = h, y1 = 0;
+    label[s] = id; stack[sp++] = s;
+    while (sp) {
+      const i = stack[--sp];
+      area++;
+      const x = i % w, y = (i - x) / w;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      // Start the cut from a pixel well inside the patch, not on its soft rim.
+      if (seed < 0 && x > 1 && x < w - 2 && y > 1 && y < h - 2 &&
+          match(i - 2) && match(i + 2) && match(i - 2 * w) && match(i + 2 * w)) seed = i;
+      if (x > 0 && !label[i - 1] && match(i - 1)) { label[i - 1] = id; stack[sp++] = i - 1; }
+      if (x < w - 1 && !label[i + 1] && match(i + 1)) { label[i + 1] = id; stack[sp++] = i + 1; }
+      if (i >= w && !label[i - w] && match(i - w)) { label[i - w] = id; stack[sp++] = i - w; }
+      if (i < n - w && !label[i + w] && match(i + w)) { label[i + w] = id; stack[sp++] = i + w; }
+    }
+    const extent = Math.max(x1 - x0, y1 - y0) + 1;
+    const thin = area / (extent * extent) < 0.2 && extent >= 25; // sliver, not a blob
+    if (area >= bigArea || (area >= thinArea && thin)) gaps.push({ id, seed: seed >= 0 ? seed : s, area });
+  }
+  return { label, gaps };
+}
+
+// ---------- 3. Keep / Remove brush (marker-controlled watershed) ----------
+
+// Marker-controlled watershed. Keep and Remove marks grow at the same time,
+// always crossing the weakest available edge first (edge = colour difference
+// between neighbouring pixels). Each pixel belongs to whichever mark reaches
+// it first, so the two sides meet along the strongest edge between them,
+// which is the subject's outline. Textures and weak lines (floor tiles,
+// folds, shading) are crossed freely.
+// A mark stops at edges of strength LIMIT or more; anything no mark can
+// reach below that keeps the automatic result.
+// marks: 0 = none, 1 = keep, 2 = remove. Runs in linear time (bucket queue).
+export function applyStrokes(src, w, h, isBg, ref, marks) {
+  const n = w * h;
+  const LIMIT = 96;
+  const lab = new Uint8Array(n); // 0 = unclaimed, 1 = keep, 2 = remove
+  const buckets = Array.from({ length: LIMIT }, () => []);
+  for (let i = 0; i < n; i++) if (marks[i]) buckets[0].push(i * 4 + marks[i]);
+
+  for (let L = 0; L < LIMIT; L++) {
+    const b = buckets[L];
+    for (let k = 0; k < b.length; k++) {
+      const e = b[k], i = (e - (e & 3)) / 4, l = e & 3;
+      if (lab[i]) continue;
+      lab[i] = l;
+      const o = i * 4, x = i % w;
+      for (let d = 0; d < 4; d++) {
+        let j;
+        if (d === 0) { if (x === 0) continue; j = i - 1; }
+        else if (d === 1) { if (x === w - 1) continue; j = i + 1; }
+        else if (d === 2) { if (i < w) continue; j = i - w; }
+        else { if (i >= n - w) continue; j = i + w; }
+        if (lab[j]) continue;
+        const q = j * 4;
+        const d0 = src[q] - src[o], d1 = src[q + 1] - src[o + 1], d2 = src[q + 2] - src[o + 2];
+        let c = Math.round(Math.sqrt(d0 * d0 + d1 * d1 + d2 * d2));
+        if (c < L) c = L;
+        if (c < LIMIT) buckets[c].push(j * 4 + l);
+      }
+    }
+    buckets[L] = null;
+  }
+
+  for (let i = 0; i < n; i++) {
+    if (!lab[i]) continue;
+    const bg = lab[i] === 2 ? 1 : 0;
+    if (bg && !isBg[i]) { ref[i * 3] = src[i * 4]; ref[i * 3 + 1] = src[i * 4 + 1]; ref[i * 3 + 2] = src[i * 4 + 2]; }
+    isBg[i] = bg;
+  }
+}
+
+// ---------- 4. Soft, halo-free edges ----------
+
+// Every pixel on the border between removed and kept areas is "un-mixed":
+// we estimate how much of it is subject (F) and how much is the local
+// background (B), give it matching transparency, and take the background
+// colour out of it. Every other kept pixel keeps its exact original value.
+// Writes into `out` (RGBA) and lowers `alpha` (one byte per pixel).
+export function unmixEdges(src, out, alpha, w, h, isBg, ref, tol) {
+  const tol2 = tol * tol;
   const minContrast2 = Math.max(tol * 1.5, 40) ** 2;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
@@ -166,7 +282,6 @@ export function floodCut(src, out, alpha, w, h, seeds, tol) {
       }
 
       if (best < minContrast2) {
-        // Subject looks too much like the background to un-mix safely.
         if (bgPix) alpha[i] = 0;
         continue;
       }
@@ -180,7 +295,7 @@ export function floodCut(src, out, alpha, w, h, seeds, tol) {
       if (!bgPix) {
         // Only treat kept pixels as a blend if they really lie between B and F.
         const r0 = v0 - a * f0, r1 = v1 - a * f1, r2 = v2 - a * f2;
-        if (r0 * r0 + r1 * r1 + r2 * r2 > tol2 || a > 0.97) continue; // keep untouched
+        if (r0 * r0 + r1 * r1 + r2 * r2 > tol2 || a > 0.97) continue;
       }
 
       if (a < 0.02) { alpha[i] = 0; continue; }
@@ -191,58 +306,6 @@ export function floodCut(src, out, alpha, w, h, seeds, tol) {
       if (na < alpha[i]) alpha[i] = na;
     }
   }
-}
-
-// Find patches of background that are fully enclosed by the subject (e.g. the
-// gap between an arm and the body), which the edge flood can't reach.
-// We record every colour the removed background actually contains (so this
-// works on gradients too), then look for big connected patches of those
-// colours. Small patches, like eye whites or highlights, are left alone.
-// Returns { label: Int32Array (pixel -> patch id), gaps: [{ id, seed, area }] }.
-export function findGaps(src, w, h, alpha, minArea) {
-  const n = w * h;
-  const bin = (o) => ((src[o] >> 3) << 10) | ((src[o + 1] >> 3) << 5) | (src[o + 2] >> 3);
-  const hist = new Uint32Array(32768);
-  let removed = 0;
-  for (let i = 0; i < n; i++) if (alpha[i] === 0 && src[i * 4 + 3] >= 16) { hist[bin(i * 4)]++; removed++; }
-  if (!removed) return { label: new Int32Array(n), gaps: [] };
-  // A colour counts as "background" if enough background pixels had it;
-  // neighbouring shades count too (one step of 8 levels per channel).
-  const minCount = Math.max(20, removed * 0.0002);
-  const isBgColor = new Uint8Array(32768);
-  for (let k = 0; k < 32768; k++) {
-    if (hist[k] < minCount) continue;
-    const r = k >> 10, g = (k >> 5) & 31, b = k & 31;
-    for (let dr = -1; dr <= 1; dr++) for (let dg = -1; dg <= 1; dg++) for (let db = -1; db <= 1; db++) {
-      const rr = r + dr, gg = g + dg, bb = b + db;
-      if (rr >= 0 && rr < 32 && gg >= 0 && gg < 32 && bb >= 0 && bb < 32) isBgColor[(rr << 10) | (gg << 5) | bb] = 1;
-    }
-  }
-  const label = new Int32Array(n);
-  const stack = new Int32Array(n);
-  const gaps = [];
-  const match = (i) => alpha[i] !== 0 && isBgColor[bin(i * 4)] === 1;
-  let id = 0;
-  for (let s = 0; s < n; s++) {
-    if (label[s] || !match(s)) continue;
-    id++;
-    let sp = 0, area = 0, seed = -1;
-    label[s] = id; stack[sp++] = s;
-    while (sp) {
-      const i = stack[--sp];
-      area++;
-      const x = i % w;
-      // Start the cut from a pixel well inside the patch, not on its soft rim.
-      if (seed < 0 && x > 1 && x < w - 2 && i >= 2 * w && i < n - 2 * w &&
-          match(i - 2) && match(i + 2) && match(i - 2 * w) && match(i + 2 * w)) seed = i;
-      if (x > 0 && !label[i - 1] && match(i - 1)) { label[i - 1] = id; stack[sp++] = i - 1; }
-      if (x < w - 1 && !label[i + 1] && match(i + 1)) { label[i + 1] = id; stack[sp++] = i + 1; }
-      if (i >= w && !label[i - w] && match(i - w)) { label[i - w] = id; stack[sp++] = i - w; }
-      if (i < n - w && !label[i + w] && match(i + w)) { label[i + w] = id; stack[sp++] = i + w; }
-    }
-    if (area >= minArea) gaps.push({ id, seed: seed >= 0 ? seed : s, area });
-  }
-  return { label, gaps };
 }
 
 function clamp255(v) { return v < 0 ? 0 : v > 255 ? 255 : Math.round(v); }

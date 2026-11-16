@@ -1,15 +1,28 @@
-import { detectBackground, backgroundSeeds, floodCut, findGaps } from './imaging.js';
+import { detectBackground, backgroundSeeds, floodRegion, findGaps, applyStrokes, unmixEdges } from './imaging.js';
 import { encodePNG } from './png.js';
 
 const $ = (id) => document.getElementById(id);
 const view = $('view');
 const ctx = view.getContext('2d');
+const marksCanvas = $('marks');
+const mctx = marksCanvas.getContext('2d');
+const wrap = $('canvasWrap');
 const stage = $('stage');
+
+const KEEP_COLOR = 'rgba(34,197,94,0.5)';
+const REMOVE_COLOR = 'rgba(239,68,68,0.5)';
+const TOOL_HINTS = {
+  click: 'Click leftover background to remove it. Click a removed gap to bring it back.',
+  keep: 'Paint over parts that must stay. For busy scenes (photos, game screenshots) paint a rough Keep stroke on the subject and a few Remove strokes on the background.',
+  remove: 'Paint over background you want gone. It spreads up to the nearest strong edge.',
+};
 
 const state = {
   file: null, name: 'image', w: 0, h: 0,
   src: null, srcImage: null, resultImage: null,
-  bg: null, clicks: [], gapInfo: null,
+  bg: null, gapInfo: null,
+  actions: [],          // {kind:'click', i} | {kind:'keepGap', i} | {kind:'stroke', type, r, pts}
+  tool: 'click', drawing: null,
   zoomed: false, showingOriginal: false, job: 0,
 };
 
@@ -30,14 +43,15 @@ async function loadFile(file) {
     Object.assign(state, {
       file, w, h, src: state.srcImage.data,
       name: (file.name || 'image').replace(/\.[^.]+$/, ''),
-      clicks: [], resultImage: null, zoomed: false,
+      actions: [], resultImage: null, zoomed: false,
     });
     state.bg = detectBackground(state.src, w, h);
-    view.width = w; view.height = h;
+    view.width = marksCanvas.width = w;
+    view.height = marksCanvas.height = h;
     $('zoom').textContent = '100%';
     stage.classList.remove('zoomed');
     fit();
-    updatePanel();
+    drawMarks();
     await run();
   } catch (err) {
     console.error(err);
@@ -76,21 +90,19 @@ function compose() {
   const { src, w, h, bg } = state;
   const n = w * h;
   const tol = +$('tol').value;
-  const out = new Uint8ClampedArray(src); // exact copy of the original pixels
-  const alpha = new Uint8Array(n);
-  for (let i = 0; i < n; i++) alpha[i] = src[i * 4 + 3];
+  const isBg = new Uint8Array(n);
+  const ref = new Float32Array(n * 3);
 
-  // 1. Background connected to the edges of the image.
-  floodCut(src, out, alpha, w, h, backgroundSeeds(src, w, h, bg.color, tol), tol);
+  // 1. Background connected to the edges of the image, tracked inwards.
+  floodRegion(src, w, h, backgroundSeeds(src, w, h, bg.color, tol), tol, isBg, ref);
 
-  // 2. Enclosed gaps + anything the user clicked, in one pass.
+  // 2. Enclosed gaps + clicked spots.
   const seeds = [];
   state.gapInfo = null;
   let removedGaps = 0;
   if ($('gaps').checked) {
-    const minArea = Math.max(200, Math.round(n * 0.0008)); // ~1800px on a 1500×1500 image
-    const info = findGaps(src, w, h, alpha, minArea);
-    const kept = new Set(state.clicks.filter((c) => c.keep).map((c) => info.label[c.i]));
+    const info = findGaps(src, w, h, isBg);
+    const kept = new Set(state.actions.filter((a) => a.kind === 'keepGap').map((a) => info.label[a.i]));
     info.removed = new Set();
     for (const g of info.gaps) {
       if (kept.has(g.id)) continue;
@@ -100,14 +112,49 @@ function compose() {
     removedGaps = info.removed.size;
     state.gapInfo = info;
   }
-  for (const c of state.clicks) if (!c.keep) seeds.push(c.i);
-  if (seeds.length) floodCut(src, out, alpha, w, h, seeds, tol);
+  for (const a of state.actions) if (a.kind === 'click') seeds.push(a.i);
+  if (seeds.length) floodRegion(src, w, h, seeds, tol, isBg, ref);
 
+  // 3. Keep / Remove brush strokes.
+  const strokes = state.actions.filter((a) => a.kind === 'stroke');
+  if (strokes.length) {
+    const marks = new Uint8Array(n);
+    for (const s of strokes) rasterStroke(marks, w, h, s);
+    applyStrokes(src, w, h, isBg, ref, marks);
+  }
+
+  // 4. Soft, halo-free edges; everything else keeps its original pixels.
+  const out = new Uint8ClampedArray(src);
+  const alpha = new Uint8Array(n);
+  for (let i = 0; i < n; i++) alpha[i] = src[i * 4 + 3];
+  unmixEdges(src, out, alpha, w, h, isBg, ref, tol);
   for (let i = 0; i < n; i++) out[i * 4 + 3] = alpha[i];
   state.resultImage = new ImageData(out, w, h);
+
   $('gapNote').textContent = removedGaps
     ? `Removed ${removedGaps} enclosed gap${removedGaps > 1 ? 's' : ''}. Click one to bring it back.`
     : '';
+}
+
+// Stamp a brush stroke into the marks array (1 = keep, 2 = remove).
+function rasterStroke(marks, w, h, s) {
+  const v = s.type === 'keep' ? 1 : 2;
+  const r = s.r, r2 = r * r;
+  const stamp = (cx, cy) => {
+    const x0 = Math.max(0, Math.floor(cx - r)), x1 = Math.min(w - 1, Math.ceil(cx + r));
+    const y0 = Math.max(0, Math.floor(cy - r)), y1 = Math.min(h - 1, Math.ceil(cy + r));
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+      const dx = x - cx, dy = y - cy;
+      if (dx * dx + dy * dy <= r2) marks[y * w + x] = v;
+    }
+  };
+  const pts = s.pts;
+  stamp(pts[0][0], pts[0][1]);
+  for (let k = 1; k < pts.length; k++) {
+    const [ax, ay] = pts[k - 1], [bx, by] = pts[k];
+    const steps = Math.max(1, Math.ceil(Math.hypot(bx - ax, by - ay) / Math.max(1, r / 2)));
+    for (let t = 1; t <= steps; t++) stamp(ax + ((bx - ax) * t) / steps, ay + ((by - ay) * t) / steps);
+  }
 }
 
 // ---------- Display ----------
@@ -116,19 +163,40 @@ function render() {
   if (img) ctx.putImageData(img, 0, 0);
 }
 
+function drawMarks() {
+  mctx.clearRect(0, 0, marksCanvas.width, marksCanvas.height);
+  const strokes = state.actions.filter((a) => a.kind === 'stroke');
+  if (state.drawing) strokes.push(state.drawing);
+  mctx.lineCap = 'round';
+  mctx.lineJoin = 'round';
+  for (const s of strokes) {
+    mctx.strokeStyle = s.type === 'keep' ? KEEP_COLOR : REMOVE_COLOR;
+    mctx.fillStyle = mctx.strokeStyle;
+    mctx.lineWidth = s.r * 2;
+    if (s.pts.length === 1) {
+      mctx.beginPath(); mctx.arc(s.pts[0][0], s.pts[0][1], s.r, 0, Math.PI * 2); mctx.fill();
+      continue;
+    }
+    mctx.beginPath();
+    mctx.moveTo(s.pts[0][0], s.pts[0][1]);
+    for (const [x, y] of s.pts.slice(1)) mctx.lineTo(x, y);
+    mctx.stroke();
+  }
+}
+
 function fit() {
   if (!state.w) return;
+  let cw, ch;
   if (state.zoomed) {
     const dpr = window.devicePixelRatio || 1;
-    view.style.width = state.w / dpr + 'px';
-    view.style.height = state.h / dpr + 'px';
-    return;
+    cw = state.w / dpr; ch = state.h / dpr;
+  } else {
+    const pad = 24;
+    const s = Math.min((stage.clientWidth - pad) / state.w, (stage.clientHeight - pad) / state.h, 2);
+    cw = Math.max(1, Math.floor(state.w * s)); ch = Math.max(1, Math.floor(state.h * s));
   }
-  const pad = 24;
-  const sw = stage.clientWidth - pad, sh = stage.clientHeight - pad;
-  const s = Math.min(sw / state.w, sh / state.h, 2);
-  view.style.width = Math.max(1, Math.floor(state.w * s)) + 'px';
-  view.style.height = Math.max(1, Math.floor(state.h * s)) + 'px';
+  wrap.style.width = cw + 'px';
+  wrap.style.height = ch + 'px';
 }
 
 function updatePanel() {
@@ -137,11 +205,15 @@ function updatePanel() {
   $('swatch').style.background = hex;
   $('swatchHex').textContent = hex;
   $('bgNote').textContent = state.bg.uniformity >= 0.8
-    ? 'Solid background — the cut follows it exactly.'
-    : 'The background changes colour — the cut tracks it as it goes. Raise the tolerance if some is left, or click it.';
+    ? 'Solid background: the cut follows it exactly.'
+    : 'The background changes colour: the cut tracks it as it goes. For busy scenes, use the Keep and Remove brushes below.';
   $('tolVal').textContent = $('tol').value;
-  $('undo').disabled = !state.clicks.length;
-  $('reset').disabled = !state.clicks.length;
+  $('brushVal').textContent = $('brush').value;
+  $('undo').disabled = !state.actions.length;
+  $('reset').disabled = !state.actions.length;
+  for (const b of $('tools').children) b.setAttribute('aria-checked', String(b.dataset.tool === state.tool));
+  $('toolHint').textContent = TOOL_HINTS[state.tool];
+  $('brushRow').hidden = state.tool === 'click';
 }
 
 function showBusy(text) { $('busyText').textContent = text; $('busy').hidden = false; }
@@ -171,7 +243,7 @@ function toastError(msg) {
   t._h = setTimeout(() => t.remove(), 5000);
 }
 
-// ---------- Events ----------
+// ---------- Events: loading ----------
 $('pick').addEventListener('click', (e) => { e.stopPropagation(); $('file').click(); });
 $('drop').addEventListener('click', () => $('file').click());
 $('drop').addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('file').click(); } });
@@ -190,41 +262,84 @@ window.addEventListener('paste', (e) => {
   if (item) loadFile(item.getAsFile());
 });
 
+// ---------- Events: settings ----------
 $('gaps').addEventListener('change', run);
-
 let tolTimer;
 $('tol').addEventListener('input', () => {
   $('tolVal').textContent = $('tol').value;
   clearTimeout(tolTimer);
   tolTimer = setTimeout(run, 60);
 });
-
-view.addEventListener('click', (e) => {
-  if (!state.resultImage || !$('busy').hidden) return;
-  const r = view.getBoundingClientRect();
-  const x = Math.floor(((e.clientX - r.left) / r.width) * state.w);
-  const y = Math.floor(((e.clientY - r.top) / r.height) * state.h);
-  if (x < 0 || y < 0 || x >= state.w || y >= state.h) return;
-  const i = y * state.w + x;
-  if (state.resultImage.data[i * 4 + 3] === 0) {
-    // Clicking a gap that was removed automatically brings it back.
-    const g = state.gapInfo;
-    if (!g || !g.removed.has(g.label[i])) return;
-    state.clicks.push({ i, keep: true });
-  } else {
-    state.clicks.push({ i });
-  }
-  run();
+$('brush').addEventListener('input', () => { $('brushVal').textContent = $('brush').value; });
+$('tools').addEventListener('click', (e) => {
+  const t = e.target.closest('button')?.dataset.tool;
+  if (!t) return;
+  state.tool = t;
+  updatePanel();
 });
-$('undo').addEventListener('click', () => { state.clicks.pop(); run(); });
-$('reset').addEventListener('click', () => { state.clicks = []; run(); });
 
-const setOriginal = (on) => { if (state.showingOriginal !== on) { state.showingOriginal = on; render(); } };
+// ---------- Events: drawing on the image ----------
+function toImage(e) {
+  const r = wrap.getBoundingClientRect();
+  return [((e.clientX - r.left) / r.width) * state.w, ((e.clientY - r.top) / r.height) * state.h];
+}
+
+wrap.addEventListener('pointerdown', (e) => {
+  if (!state.resultImage || !$('busy').hidden || e.button !== 0) return;
+  const [fx, fy] = toImage(e);
+  const x = Math.floor(fx), y = Math.floor(fy);
+  if (x < 0 || y < 0 || x >= state.w || y >= state.h) return;
+
+  if (state.tool === 'click') {
+    const i = y * state.w + x;
+    if (state.resultImage.data[i * 4 + 3] === 0) {
+      const g = state.gapInfo;
+      if (!g || !g.removed.has(g.label[i])) return;
+      state.actions.push({ kind: 'keepGap', i });
+    } else {
+      state.actions.push({ kind: 'click', i });
+    }
+    run();
+    return;
+  }
+
+  // Brush: radius in image pixels, from the on-screen brush size.
+  const scale = state.w / wrap.getBoundingClientRect().width;
+  const r = Math.max(1, (+$('brush').value / 2) * scale);
+  state.drawing = { kind: 'stroke', type: state.tool, r, pts: [[fx, fy]] };
+  wrap.setPointerCapture(e.pointerId);
+  drawMarks();
+});
+wrap.addEventListener('pointermove', (e) => {
+  if (!state.drawing) return;
+  state.drawing.pts.push(toImage(e));
+  drawMarks();
+});
+const endStroke = () => {
+  if (!state.drawing) return;
+  state.actions.push(state.drawing);
+  state.drawing = null;
+  drawMarks();
+  run();
+};
+wrap.addEventListener('pointerup', endStroke);
+wrap.addEventListener('pointercancel', endStroke);
+
+$('undo').addEventListener('click', () => { state.actions.pop(); drawMarks(); run(); });
+$('reset').addEventListener('click', () => { state.actions = []; drawMarks(); run(); });
+
+// ---------- Events: view ----------
+const setOriginal = (on) => {
+  if (state.showingOriginal === on) return;
+  state.showingOriginal = on;
+  wrap.classList.toggle('hide-marks', on);
+  render();
+};
 $('compare').addEventListener('pointerdown', () => setOriginal(true));
 for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) $('compare').addEventListener(ev, () => setOriginal(false));
 window.addEventListener('keydown', (e) => {
   if (e.code === 'Space' && !$('work').hidden && !e.repeat && !/INPUT|SELECT|BUTTON/.test(document.activeElement?.tagName)) { e.preventDefault(); setOriginal(true); }
-  if ((e.ctrlKey || e.metaKey) && e.key === 'z' && state.clicks.length) { e.preventDefault(); $('undo').click(); }
+  if ((e.ctrlKey || e.metaKey) && e.key === 'z' && state.actions.length) { e.preventDefault(); $('undo').click(); }
 });
 window.addEventListener('keyup', (e) => { if (e.code === 'Space') setOriginal(false); });
 
