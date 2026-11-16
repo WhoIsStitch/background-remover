@@ -1,6 +1,6 @@
 # Clearcut – background remover
 
-A fast background remover that runs entirely in your browser. Nothing is uploaded.
+A fast background remover that runs entirely in your browser. No AI and no upload.
 
 **Live site:** https://whoisstitch.github.io/background-remover/
 
@@ -9,12 +9,13 @@ A fast background remover that runs entirely in your browser. Nothing is uploade
 - Only transparency is added. Every pixel that stays solid keeps its exact original colour.
 - The PNG is written by our own lossless encoder (`png.js`), not by the browser's canvas, so semi-transparent edge pixels are saved exactly too.
 
-## Two methods
-- **Flat colour**: for art, logos, product shots and anything on a single-colour background. It removes the colour touching the edges and un-mixes the anti-aliased edge pixels, so there's no white halo. It's instant (about 70 ms for 1500×1500).
-- **AI**: for photos. It uses [IMG.LY background-removal](https://github.com/imgly/background-removal-js) (AGPL), running locally with WebGPU when available. The model downloads once (44–88 MB) and is then cached. An optional guided filter snaps the mask edges to the photo.
-- **Auto** checks the image border and picks the right method.
+## How the cut works
+1. **Background tracking:** the cut starts from the background at the image edges and spreads inward. It carries an estimate of the background colour that slowly adapts as it goes, so gradients, vignettes, soft shadows and uneven scans are followed. The estimate only adapts in smooth areas, so it can't creep through an outline.
+2. **Edge un-mixing:** each pixel on the boundary is split into "subject" and "local background". It gets matching transparency, and the background colour is taken out of it, so there's no halo on any new background.
+3. **Enclosed gaps:** big patches of background colour that are fully surrounded by the subject (like the space between an arm and the body) are removed automatically. Small details such as eye whites are kept. Click a removed gap to bring it back.
+4. **Click to remove:** click any leftover patch to remove it too. Ctrl+Z undoes the last click.
 
-Enclosed background gaps (like the space between an arm and the body) are removed automatically; small white details such as eye whites are kept. Click a removed gap to bring it back, or click any leftover patch to remove it.
+It's about 0.1 s for a 1500×1500 image.
 
 ## Run locally
 ```

@@ -47,33 +47,15 @@
 
       <aside class="panel">
         <div class="group">
-          <label class="label">Method</label>
-          <div class="seg" role="radiogroup" id="mode">
-            <button role="radio" data-mode="auto" aria-checked="true">Auto</button>
-            <button role="radio" data-mode="flat" aria-checked="false">Flat colour</button>
-            <button role="radio" data-mode="ai" aria-checked="false">AI</button>
-          </div>
-          <p id="modeNote" class="hint"></p>
-        </div>
-
-        <div class="group" id="flatOpts">
-          <label class="label">Background colour</label>
+          <label class="label">Detected background</label>
           <div class="row"><span id="swatch" class="swatch"></span><code id="swatchHex"></code></div>
+          <p id="bgNote" class="hint"></p>
           <label class="check"><input type="checkbox" id="gaps" checked> Also remove enclosed gaps</label>
           <p id="gapNote" class="hint"></p>
         </div>
 
-        <div class="group" id="aiOpts" hidden>
-          <label class="label" for="model">AI model</label>
-          <select id="model">
-            <option value="isnet_fp16">Best quality (88 MB, downloaded once)</option>
-            <option value="isnet_quint8">Faster (44 MB, downloaded once)</option>
-          </select>
-          <label class="check"><input type="checkbox" id="refine" checked> Snap edges to the photo</label>
-        </div>
-
         <div class="group">
-          <label class="label" for="tol">Colour tolerance <span id="tolVal" class="muted"></span></label>
+          <label class="label" for="tol">Tolerance <span id="tolVal" class="muted"></span></label>
           <input type="range" id="tol" min="4" max="120" value="36">
           <p class="hint">Click any leftover background on the image to remove it.</p>
           <div class="row">
@@ -101,7 +83,7 @@
   </main>
 
   <footer class="foot muted">
-    Flat colour mode is exact and instant. AI mode uses <a href="https://github.com/imgly/background-removal-js">IMG.LY background-removal</a> (AGPL) running locally.
+    No AI, no upload. The cut tracks the background colour across the image and un-mixes the edges, at full resolution.
   </footer>
 
   <script type="module" src="app.js"></script>

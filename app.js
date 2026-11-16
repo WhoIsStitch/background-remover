@@ -1,8 +1,5 @@
-import { detectBackground, borderIndices, floodCut, findGaps, maskFromBlob, refineMask } from './imaging.js';
+import { detectBackground, backgroundSeeds, floodCut, findGaps } from './imaging.js';
 import { encodePNG } from './png.js';
-
-const AI_LIB = 'https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.7.0/+esm';
-const FLAT_THRESHOLD = 0.8; // share of the border that must be one colour for Auto to pick Flat
 
 const $ = (id) => document.getElementById(id);
 const view = $('view');
@@ -12,8 +9,7 @@ const stage = $('stage');
 const state = {
   file: null, name: 'image', w: 0, h: 0,
   src: null, srcImage: null, resultImage: null,
-  bg: null, mode: 'auto', clicks: [],
-  aiMasks: new Map(), aiLib: null,
+  bg: null, clicks: [], gapInfo: null,
   zoomed: false, showingOriginal: false, job: 0,
 };
 
@@ -34,14 +30,14 @@ async function loadFile(file) {
     Object.assign(state, {
       file, w, h, src: state.srcImage.data,
       name: (file.name || 'image').replace(/\.[^.]+$/, ''),
-      clicks: [], aiMasks: new Map(), resultImage: null, zoomed: false,
+      clicks: [], resultImage: null, zoomed: false,
     });
     state.bg = detectBackground(state.src, w, h);
     view.width = w; view.height = h;
     $('zoom').textContent = '100%';
     stage.classList.remove('zoomed');
     fit();
-    updateClickButtons();
+    updatePanel();
     await run();
   } catch (err) {
     console.error(err);
@@ -59,115 +55,59 @@ function reset() {
 }
 
 // ---------- Processing ----------
-function effectiveMode() {
-  if (state.mode !== 'auto') return state.mode;
-  return state.bg.uniformity >= FLAT_THRESHOLD ? 'flat' : 'ai';
-}
-
 async function run() {
   if (!state.src) return;
   const job = ++state.job;
-  const mode = effectiveMode();
-  updatePanel(mode);
   $('download').disabled = true;
-  const t0 = performance.now();
-
-  let aiAlpha = null;
-  if (mode === 'ai') {
-    aiAlpha = await getAiMask(job);
-    if (job !== state.job) return;
-    if (!aiAlpha) { hideBusy(); return; }
-  }
-  if (state.clicks.length || mode === 'flat') showBusy('Cutting…');
+  showBusy('Cutting…');
   await nextFrame();
   if (job !== state.job) return;
-
-  compose(mode, aiAlpha);
+  const t0 = performance.now();
+  compose();
+  const ms = Math.round(performance.now() - t0);
   hideBusy();
   render();
+  updatePanel();
   $('download').disabled = false;
-  const ms = Math.round(performance.now() - t0);
   $('info').textContent = `${state.w} × ${state.h}px · ${ms < 1000 ? ms + ' ms' : (ms / 1000).toFixed(1) + ' s'}`;
 }
 
-function compose(mode, aiAlpha) {
-  const { src, w, h } = state;
+function compose() {
+  const { src, w, h, bg } = state;
   const n = w * h;
   const tol = +$('tol').value;
   const out = new Uint8ClampedArray(src); // exact copy of the original pixels
   const alpha = new Uint8Array(n);
   for (let i = 0; i < n; i++) alpha[i] = src[i * 4 + 3];
 
+  // 1. Background connected to the edges of the image.
+  floodCut(src, out, alpha, w, h, backgroundSeeds(src, w, h, bg.color, tol), tol);
+
+  // 2. Enclosed gaps + anything the user clicked, in one pass.
+  const seeds = [];
   state.gapInfo = null;
-  if (mode === 'flat') {
-    floodCut(src, out, alpha, w, h, borderIndices(w, h), state.bg.color, tol);
-    if ($('gaps').checked) {
-      const minArea = Math.max(200, Math.round(n * 0.0008)); // ~1800px on a 1500×1500 image
-      const info = findGaps(src, w, h, state.bg.color, alpha, Math.min(tol, 20), minArea);
-      const kept = new Set(state.clicks.filter((c) => c.keep).map((c) => info.label[c.i]));
-      let removed = 0;
-      for (const g of info.gaps) {
-        if (kept.has(g.id)) continue;
-        floodCut(src, out, alpha, w, h, [g.seed], state.bg.color, tol);
-        removed++;
-      }
-      info.removed = new Set(info.gaps.filter((g) => !kept.has(g.id)).map((g) => g.id));
-      state.gapInfo = info;
-      $('gapNote').textContent = removed
-        ? `Removed ${removed} enclosed gap${removed > 1 ? 's' : ''}. Click one to bring it back.`
-        : kept.size ? 'Kept the gaps you clicked.' : '';
-    } else {
-      $('gapNote').textContent = '';
+  let removedGaps = 0;
+  if ($('gaps').checked) {
+    const minArea = Math.max(200, Math.round(n * 0.0008)); // ~1800px on a 1500×1500 image
+    const info = findGaps(src, w, h, alpha, minArea);
+    const kept = new Set(state.clicks.filter((c) => c.keep).map((c) => info.label[c.i]));
+    info.removed = new Set();
+    for (const g of info.gaps) {
+      if (kept.has(g.id)) continue;
+      seeds.push(g.seed);
+      info.removed.add(g.id);
     }
-  } else {
-    for (let i = 0; i < n; i++) alpha[i] = Math.round((alpha[i] * aiAlpha[i]) / 255);
+    removedGaps = info.removed.size;
+    state.gapInfo = info;
   }
-  for (const c of state.clicks) if (!c.keep) floodCut(src, out, alpha, w, h, [c.i], c.color, tol);
+  for (const c of state.clicks) if (!c.keep) seeds.push(c.i);
+  if (seeds.length) floodCut(src, out, alpha, w, h, seeds, tol);
 
   for (let i = 0; i < n; i++) out[i * 4 + 3] = alpha[i];
   state.resultImage = new ImageData(out, w, h);
-}
-
-async function getAiMask(job) {
-  const model = $('model').value;
-  const refine = $('refine').checked;
-  const key = model + (refine ? ':r' : '');
-  if (state.aiMasks.has(key)) return state.aiMasks.get(key);
-
-  let raw = state.aiMasks.get(model);
-  if (!raw) {
-    try {
-      showBusy('Loading AI…');
-      if (!state.aiLib) state.aiLib = await import(AI_LIB);
-      const progress = (k, cur, total) => {
-        if (job !== state.job) return;
-        if (String(k).startsWith('fetch') && total) showBusy(`Downloading AI model… ${Math.round((cur / total) * 100)}%`);
-        else if (String(k).startsWith('compute')) showBusy('Finding the subject…');
-      };
-      const opts = { model, progress, output: { format: 'image/png' } };
-      let blob;
-      try {
-        blob = await state.aiLib.segmentForeground(state.file, { ...opts, device: navigator.gpu ? 'gpu' : 'cpu' });
-      } catch (e) {
-        if (!navigator.gpu) throw e;
-        console.warn('GPU failed, using CPU', e);
-        blob = await state.aiLib.segmentForeground(state.file, { ...opts, device: 'cpu' });
-      }
-      if (job !== state.job) return null;
-      raw = await maskFromBlob(blob, state.w, state.h);
-      state.aiMasks.set(model, raw);
-    } catch (err) {
-      console.error(err);
-      toastError('The AI model could not load. Check your connection, or use Flat colour.');
-      return null;
-    }
-  }
-  if (!refine) return raw;
-  showBusy('Sharpening edges…');
-  await nextFrame();
-  const refined = refineMask(state.src, state.w, state.h, raw);
-  state.aiMasks.set(key, refined);
-  return refined;
+  $('gapNote').textContent = removedGaps
+    ? `Removed ${removedGaps} enclosed gap${removedGaps > 1 ? 's' : ''}. Click one to bring it back.`
+    : '';
 }
 
 // ---------- Display ----------
@@ -191,32 +131,23 @@ function fit() {
   view.style.height = Math.max(1, Math.floor(state.h * s)) + 'px';
 }
 
-function updatePanel(mode) {
-  for (const b of $('mode').children) b.setAttribute('aria-checked', String(b.dataset.mode === state.mode));
-  $('flatOpts').hidden = mode !== 'flat';
-  $('aiOpts').hidden = mode !== 'ai';
+function updatePanel() {
   const [r, g, b] = state.bg.color;
   const hex = '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('');
   $('swatch').style.background = hex;
   $('swatchHex').textContent = hex;
-  const notes = {
-    'auto:flat': 'Auto chose Flat colour: the background is one solid colour, so the cut is exact.',
-    'auto:ai': 'Auto chose AI: the background has more than one colour.',
-    'flat:flat': 'Removes the solid colour touching the edges of the image. Exact and instant.',
-    'ai:ai': 'Finds the subject with an AI model that runs on your device.',
-  };
-  $('modeNote').textContent = notes[`${state.mode}:${mode}`];
+  $('bgNote').textContent = state.bg.uniformity >= 0.8
+    ? 'Solid background — the cut follows it exactly.'
+    : 'The background changes colour — the cut tracks it as it goes. Raise the tolerance if some is left, or click it.';
   $('tolVal').textContent = $('tol').value;
-}
-
-function updateClickButtons() {
   $('undo').disabled = !state.clicks.length;
   $('reset').disabled = !state.clicks.length;
 }
 
 function showBusy(text) { $('busyText').textContent = text; $('busy').hidden = false; }
 function hideBusy() { $('busy').hidden = true; }
-// Let the "Working…" overlay paint before heavy work. Falls back to a timer,
+
+// Let the "Cutting…" overlay paint before heavy work. Falls back to a timer,
 // because hidden tabs never fire animation frames.
 function nextFrame() {
   return new Promise((r) => {
@@ -233,7 +164,6 @@ function toastError(msg) {
     t = document.createElement('div');
     t.className = 'toast';
     t.setAttribute('role', 'alert');
-    Object.assign(t.style, { position: 'fixed', left: '50%', bottom: '24px', transform: 'translateX(-50%)', background: '#c0362c', color: '#fff', padding: '10px 16px', borderRadius: '8px', zIndex: 10, maxWidth: '90vw' });
     document.body.append(t);
   }
   t.textContent = msg;
@@ -260,14 +190,6 @@ window.addEventListener('paste', (e) => {
   if (item) loadFile(item.getAsFile());
 });
 
-$('mode').addEventListener('click', (e) => {
-  const m = e.target.closest('button')?.dataset.mode;
-  if (!m || m === state.mode) return;
-  state.mode = m;
-  run();
-});
-$('model').addEventListener('change', run);
-$('refine').addEventListener('change', run);
 $('gaps').addEventListener('change', run);
 
 let tolTimer;
@@ -283,20 +205,19 @@ view.addEventListener('click', (e) => {
   const x = Math.floor(((e.clientX - r.left) / r.width) * state.w);
   const y = Math.floor(((e.clientY - r.top) / r.height) * state.h);
   if (x < 0 || y < 0 || x >= state.w || y >= state.h) return;
-  const i = y * state.w + x, o = i * 4;
-  if (state.resultImage.data[o + 3] === 0) {
+  const i = y * state.w + x;
+  if (state.resultImage.data[i * 4 + 3] === 0) {
     // Clicking a gap that was removed automatically brings it back.
     const g = state.gapInfo;
     if (!g || !g.removed.has(g.label[i])) return;
     state.clicks.push({ i, keep: true });
   } else {
-    state.clicks.push({ i, color: [state.src[o], state.src[o + 1], state.src[o + 2]] });
+    state.clicks.push({ i });
   }
-  updateClickButtons();
   run();
 });
-$('undo').addEventListener('click', () => { state.clicks.pop(); updateClickButtons(); run(); });
-$('reset').addEventListener('click', () => { state.clicks = []; updateClickButtons(); run(); });
+$('undo').addEventListener('click', () => { state.clicks.pop(); run(); });
+$('reset').addEventListener('click', () => { state.clicks = []; run(); });
 
 const setOriginal = (on) => { if (state.showingOriginal !== on) { state.showingOriginal = on; render(); } };
 $('compare').addEventListener('pointerdown', () => setOriginal(true));
