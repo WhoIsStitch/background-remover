@@ -9,15 +9,22 @@ A fast background remover that runs entirely in your browser. No AI and no uploa
 - Only transparency is added. Every pixel that stays solid keeps its exact original colour.
 - The PNG is written by our own lossless encoder (`png.js`), not by the browser's canvas, so semi-transparent edge pixels are saved exactly too.
 
-## How the cut works
-1. **Background tracking:** the cut starts from the background at the image edges and spreads inward. It carries an estimate of the background colour that slowly adapts as it goes, so gradients, vignettes, soft shadows and uneven scans are followed. The estimate only adapts in smooth areas, so it can't creep through an outline.
-2. **Edge un-mixing:** each pixel on the boundary is split into "subject" and "local background". It gets matching transparency, and the background colour is taken out of it, so there's no halo on any new background.
-3. **Enclosed gaps:** patches made of exactly the background's colours that are fully surrounded by the subject are removed automatically. That includes big ones (the space between an arm and the body) and thin slivers (between strands of hair). Small compact details such as eye whites are kept, and so is near-white skin. Click a removed gap to bring it back.
-4. **Touch-up tools:**
-   - **Click:** removes a leftover patch.
-   - **Keep / Remove brushes:** for busy scenes like photos and game screenshots. Paint a rough Keep stroke on the subject and a few Remove strokes on the background. A marker-controlled watershed grows both sets of marks at once, always across the weakest edge first, so they meet along the subject's outline. Textures such as floor tiles are crossed freely. Ctrl+Z undoes.
+## Automatic methods
+**Auto** picks one of these for you:
+- **Colour:** for art, logos and anything on a solid or smoothly changing background. The cut starts at the image edges and tracks the background colour inward, following gradients and soft shadows but stopping at outlines. Enclosed gaps, such as the space between an arm and the body or a sliver between strands of hair, are removed too. Eye whites and near-white skin are kept.
+- **Subject:** for busy backgrounds like photos and game screenshots. It works like GrabCut, without AI. It learns which colours belong to the background and which to the subject, plants seeds where it's sure, and grows them with a watershed until they meet at the strongest edge, the outline. It repeats this to refine the result, then drops stray specks.
 
-It's about 0.1 s for a 1500×1500 image.
+## Tools
+| Tool | Key | What it does |
+|---|---|---|
+| Select | S | Hover to highlight an area. Click removes it, Shift+click keeps it. Untick "Connected area only" to grab that colour everywhere. |
+| Box | B | Drag a box around the subject. Everything outside goes, and the inside is found automatically. |
+| Keep / Remove | K / R | Brushes for fine touch-ups. They spread to the nearest strong edge. |
+
+- **Trim edge:** shaves 1–4 px off the outline to remove fringes.
+- **Shortcuts:** Ctrl+Z undoes; hold Space to compare with the original.
+
+Every step ends with **edge un-mixing**: each boundary pixel is split into subject and local background, so there's no halo on a new background.
 
 ## Run locally
 ```

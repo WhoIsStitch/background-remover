@@ -37,6 +37,7 @@
           <div id="canvasWrap" class="canvas-wrap">
             <canvas id="view"></canvas>
             <canvas id="marks"></canvas>
+            <canvas id="hl"></canvas>
           </div>
           <div id="busy" class="busy" hidden><div class="spinner"></div><span id="busyText">Working…</span></div>
         </div>
@@ -50,11 +51,18 @@
 
       <aside class="panel">
         <div class="group">
-          <label class="label">Detected background</label>
-          <div class="row"><span id="swatch" class="swatch"></span><code id="swatchHex"></code></div>
-          <p id="bgNote" class="hint"></p>
-          <label class="check"><input type="checkbox" id="gaps" checked> Also remove enclosed gaps</label>
-          <p id="gapNote" class="hint"></p>
+          <label class="label">Method</label>
+          <div class="seg small" id="method" role="radiogroup">
+            <button role="radio" data-method="auto" aria-checked="true">Auto</button>
+            <button role="radio" data-method="colour" aria-checked="false" title="Remove the background colour">Colour</button>
+            <button role="radio" data-method="subject" aria-checked="false" title="Find the subject automatically">Subject</button>
+          </div>
+          <p id="methodNote" class="hint"></p>
+          <div id="colourOpts" class="group">
+            <div class="row"><span id="swatch" class="swatch"></span><code id="swatchHex"></code><span class="muted small-text">background</span></div>
+            <label class="check"><input type="checkbox" id="gaps" checked> Also remove enclosed gaps</label>
+            <p id="gapNote" class="hint"></p>
+          </div>
         </div>
 
         <div class="group">
@@ -63,20 +71,27 @@
         </div>
 
         <div class="group">
-          <label class="label">Touch up</label>
+          <label class="label">Tools</label>
           <div class="seg small" id="tools" role="radiogroup">
-            <button role="radio" data-tool="click" aria-checked="true">Click</button>
-            <button role="radio" data-tool="keep" aria-checked="false"><span class="dot keep"></span>Keep</button>
-            <button role="radio" data-tool="remove" aria-checked="false"><span class="dot remove"></span>Remove</button>
+            <button role="radio" data-tool="select" aria-checked="true" title="Select (S)">Select</button>
+            <button role="radio" data-tool="box" aria-checked="false" title="Box (B)">Box</button>
+            <button role="radio" data-tool="keep" aria-checked="false" title="Keep brush (K)"><span class="dot keep"></span>Keep</button>
+            <button role="radio" data-tool="remove" aria-checked="false" title="Remove brush (R)"><span class="dot remove"></span>Remove</button>
           </div>
           <p id="toolHint" class="hint"></p>
+          <label id="contigRow" class="check"><input type="checkbox" id="contiguous" checked> Connected area only</label>
           <div id="brushRow" class="group" hidden>
             <label class="label" for="brush">Brush size <span id="brushVal" class="muted"></span></label>
             <input type="range" id="brush" min="2" max="80" value="16">
           </div>
+        </div>
+
+        <div class="group">
+          <label class="label" for="shrink">Trim edge <span id="shrinkVal" class="muted"></span></label>
+          <input type="range" id="shrink" min="0" max="4" value="0">
           <div class="row">
-            <button id="undo" class="btn" disabled>Undo</button>
-            <button id="reset" class="btn" disabled>Clear all</button>
+            <button id="undo" class="btn" disabled title="Ctrl+Z">Undo</button>
+            <button id="reset" class="btn" disabled>Start over</button>
           </div>
         </div>
 
@@ -99,7 +114,7 @@
   </main>
 
   <footer class="foot muted">
-    No AI, no upload. Background tracking, enclosed-gap detection and a marker watershed for the brushes, all at full resolution.
+    No AI, no upload. Colour models, background tracking and watershed segmentation, all at full resolution.
   </footer>
 
   <script type="module" src="app.js"></script>

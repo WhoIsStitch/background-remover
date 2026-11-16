@@ -183,10 +183,24 @@ export function findGaps(src, w, h, isBg) {
 // marks: 0 = none, 1 = keep, 2 = remove. Runs in linear time (bucket queue).
 export function applyStrokes(src, w, h, isBg, ref, marks) {
   const n = w * h;
-  const LIMIT = 96;
-  const lab = new Uint8Array(n); // 0 = unclaimed, 1 = keep, 2 = remove
+  const lab = watershed(src, w, h, marks, 96);
+  for (let i = 0; i < n; i++) {
+    if (!lab[i]) continue;
+    const bg = lab[i] === 2 ? 1 : 0;
+    if (bg && !isBg[i]) { ref[i * 3] = src[i * 4]; ref[i * 3 + 1] = src[i * 4 + 1]; ref[i * 3 + 2] = src[i * 4 + 2]; }
+    isBg[i] = bg;
+  }
+}
+
+// Grow labelled seeds (1 = subject, 2 = background) across the image, always
+// crossing the weakest edge first. Returns labels; 0 where nothing reached
+// below `limit` (edge strength 0..442).
+export function watershed(src, w, h, seeds, limit) {
+  const n = w * h;
+  const LIMIT = limit;
+  const lab = new Uint8Array(n); // 0 = unclaimed
   const buckets = Array.from({ length: LIMIT }, () => []);
-  for (let i = 0; i < n; i++) if (marks[i]) buckets[0].push(i * 4 + marks[i]);
+  for (let i = 0; i < n; i++) if (seeds[i]) buckets[0].push(i * 4 + seeds[i]);
 
   for (let L = 0; L < LIMIT; L++) {
     const b = buckets[L];
@@ -211,12 +225,165 @@ export function applyStrokes(src, w, h, isBg, ref, marks) {
     }
     buckets[L] = null;
   }
+  return lab;
+}
 
+// ---------- Automatic subject finder (GrabCut-style, no AI) ----------
+
+// Separates the subject from a busy background inside `box` [x0, y0, x1, y1).
+// 1. Learn colour models: background from outside the box, subject from inside.
+// 2. Pixels whose colour is clearly subject-like or clearly background-like
+//    (and whose neighbours agree) become seeds.
+// 3. A watershed grows the seeds across the image until they meet along the
+//    strongest edges, i.e. the subject's outline.
+// 4. Re-learn the colour models from that result and repeat.
+// Finally, small specks that got labelled as subject are dropped.
+// hardOutside: pixels outside the box are always background (Box tool).
+// Without it (automatic mode), the border strip only informs the colour model.
+export function subjectCut(src, w, h, box, hardOutside) {
+  const n = w * h;
+  const [bx0, by0, bx1, by1] = box;
+  const inBox = new Uint8Array(n);
+  for (let y = by0; y < by1; y++) inBox.fill(1, y * w + bx0, y * w + bx1);
+  const bin = new Uint16Array(n);
   for (let i = 0; i < n; i++) {
-    if (!lab[i]) continue;
-    const bg = lab[i] === 2 ? 1 : 0;
-    if (bg && !isBg[i]) { ref[i * 3] = src[i * 4]; ref[i * 3 + 1] = src[i * 4 + 1]; ref[i * 3 + 2] = src[i * 4 + 2]; }
-    isBg[i] = bg;
+    const o = i * 4;
+    bin[i] = ((src[o] >> 4) << 8) | ((src[o + 1] >> 4) << 4) | (src[o + 2] >> 4);
+  }
+
+  let lab = new Uint8Array(n);
+  for (let i = 0; i < n; i++) lab[i] = inBox[i] ? 1 : 2;
+
+  const T = 1.0; // log-likelihood ratio needed to be a seed
+  const ratio = new Float32Array(4096);
+  const cand = new Uint8Array(n);
+  const seeds = new Uint8Array(n);
+  for (let iter = 0; iter < 4; iter++) {
+    // Colour models (16 levels per channel), blurred so near colours count too.
+    const hf = new Float32Array(4096), hb = new Float32Array(4096);
+    let nf = 0, nb = 0;
+    for (let i = 0; i < n; i++) {
+      if (lab[i] === 1) { hf[bin[i]]++; nf++; } else { hb[bin[i]]++; nb++; }
+    }
+    const sf = blurHist(hf), sb = blurHist(hb);
+    for (let k = 0; k < 4096; k++) ratio[k] = Math.log((sf[k] / (nf || 1) + 1e-7) / (sb[k] / (nb || 1) + 1e-7));
+
+    for (let i = 0; i < n; i++) {
+      if (hardOutside && !inBox[i]) { cand[i] = 2; continue; }
+      const r = ratio[bin[i]];
+      cand[i] = r > T ? 1 : r < -T ? 2 : 0;
+    }
+    // A seed needs its 4 neighbours to agree (removes noise).
+    let fgSeeds = 0;
+    for (let i = 0; i < n; i++) {
+      const c = cand[i];
+      seeds[i] = 0;
+      if (!c) continue;
+      const x = i % w;
+      if ((x > 0 && cand[i - 1] !== c) || (x < w - 1 && cand[i + 1] !== c) ||
+          (i >= w && cand[i - w] !== c) || (i < n - w && cand[i + w] !== c)) continue;
+      seeds[i] = c;
+      if (c === 1) fgSeeds++;
+    }
+    if (!fgSeeds) break; // nothing looks like a subject: keep the last result
+    const next = watershed(src, w, h, seeds, 443);
+    for (let i = 0; i < n; i++) if (!next[i]) next[i] = lab[i];
+    lab = next;
+  }
+
+  // Drop subject specks smaller than 1% of the biggest subject piece.
+  const comp = new Int32Array(n), stack = new Int32Array(n), sizes = [0];
+  let id = 0;
+  for (let s = 0; s < n; s++) {
+    if (lab[s] !== 1 || comp[s]) continue;
+    id++;
+    let sp = 0, area = 0;
+    comp[s] = id; stack[sp++] = s;
+    while (sp) {
+      const i = stack[--sp]; area++;
+      const x = i % w;
+      if (x > 0 && lab[i - 1] === 1 && !comp[i - 1]) { comp[i - 1] = id; stack[sp++] = i - 1; }
+      if (x < w - 1 && lab[i + 1] === 1 && !comp[i + 1]) { comp[i + 1] = id; stack[sp++] = i + 1; }
+      if (i >= w && lab[i - w] === 1 && !comp[i - w]) { comp[i - w] = id; stack[sp++] = i - w; }
+      if (i < n - w && lab[i + w] === 1 && !comp[i + w]) { comp[i + w] = id; stack[sp++] = i + w; }
+    }
+    sizes.push(area);
+  }
+  let biggest = 0;
+  for (const a of sizes) if (a > biggest) biggest = a;
+  const isBg = new Uint8Array(n);
+  for (let i = 0; i < n; i++) isBg[i] = lab[i] === 1 && sizes[comp[i]] >= biggest * 0.01 ? 0 : 1;
+  return isBg;
+}
+
+function blurHist(hist) {
+  const out = new Float32Array(4096);
+  for (let r = 0; r < 16; r++) for (let g = 0; g < 16; g++) for (let b = 0; b < 16; b++) {
+    const v = hist[(r << 8) | (g << 4) | b];
+    if (!v) continue;
+    for (let dr = -1; dr <= 1; dr++) for (let dg = -1; dg <= 1; dg++) for (let db = -1; db <= 1; db++) {
+      const rr = r + dr, gg = g + dg, bb = b + db;
+      if (rr < 0 || rr > 15 || gg < 0 || gg > 15 || bb < 0 || bb > 15) continue;
+      out[(rr << 8) | (gg << 4) | bb] += v * (dr || dg || db ? 0.25 : 1);
+    }
+  }
+  return out;
+}
+
+// ---------- Select tool ----------
+
+let stampBuf = null, listBuf = null, gen = 0;
+
+// The area the Select tool highlights at pixel `s`: pixels within `tol` of
+// its colour, either connected to it (contiguous) or anywhere in the image.
+// Returns { idx: Int32Array of pixel indices (a view, copy to keep), x0, y0, x1, y1 }.
+export function regionAt(src, w, h, s, tol, contiguous) {
+  const n = w * h;
+  if (!stampBuf || stampBuf.length !== n) { stampBuf = new Uint32Array(n); listBuf = new Int32Array(n); gen = 0; }
+  if (++gen >= 0xfffffff0) { stampBuf.fill(0); gen = 1; }
+  const o = s * 4, c0 = src[o], c1 = src[o + 1], c2 = src[o + 2], t2 = tol * tol;
+  const ok = (j) => {
+    const q = j * 4;
+    const d0 = src[q] - c0, d1 = src[q + 1] - c1, d2 = src[q + 2] - c2;
+    return d0 * d0 + d1 * d1 + d2 * d2 <= t2;
+  };
+  let count = 0, x0 = w, y0 = h, x1 = 0, y1 = 0;
+  const add = (j) => {
+    listBuf[count++] = j;
+    const x = j % w, y = (j - x) / w;
+    if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+  };
+  if (!contiguous) {
+    for (let j = 0; j < n; j++) if (ok(j)) add(j);
+  } else {
+    stampBuf[s] = gen; add(s);
+    for (let k = 0; k < count; k++) {
+      const i = listBuf[k], x = i % w;
+      if (x > 0 && stampBuf[i - 1] !== gen && ok(i - 1)) { stampBuf[i - 1] = gen; add(i - 1); }
+      if (x < w - 1 && stampBuf[i + 1] !== gen && ok(i + 1)) { stampBuf[i + 1] = gen; add(i + 1); }
+      if (i >= w && stampBuf[i - w] !== gen && ok(i - w)) { stampBuf[i - w] = gen; add(i - w); }
+      if (i < n - w && stampBuf[i + w] !== gen && ok(i + w)) { stampBuf[i + w] = gen; add(i + w); }
+    }
+  }
+  return { idx: listBuf.subarray(0, count), x0, y0, x1, y1 };
+}
+
+// Trim `px` pixels off the subject's outline (removes leftover fringes).
+export function shrinkEdge(src, w, h, isBg, ref, px) {
+  const n = w * h;
+  for (let k = 0; k < px; k++) {
+    const grow = [];
+    for (let i = 0; i < n; i++) {
+      if (isBg[i]) continue;
+      const x = i % w;
+      const j = x > 0 && isBg[i - 1] ? i - 1 : x < w - 1 && isBg[i + 1] ? i + 1 : i >= w && isBg[i - w] ? i - w : i < n - w && isBg[i + w] ? i + w : -1;
+      if (j >= 0) grow.push(i, j);
+    }
+    for (let g = 0; g < grow.length; g += 2) {
+      const i = grow[g], j = grow[g + 1];
+      isBg[i] = 1;
+      ref[i * 3] = ref[j * 3]; ref[i * 3 + 1] = ref[j * 3 + 1]; ref[i * 3 + 2] = ref[j * 3 + 2];
+    }
   }
 }
 
