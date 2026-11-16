@@ -137,6 +137,43 @@ export function floodCut(src, out, alpha, w, h, seeds, bg, tol) {
   }
 }
 
+// Find patches of background colour that are fully enclosed by the subject
+// (e.g. the gap between an arm and the body), which the edge flood can't reach.
+// Only patches that closely match the background and are big enough count,
+// so small white details like eye whites or highlights are left alone.
+// Returns { label: Int32Array (pixel -> patch id), gaps: [{ id, seed, area }] }.
+export function findGaps(src, w, h, bg, alpha, tol, minArea) {
+  const n = w * h, t2 = tol * tol;
+  const [B0, B1, B2] = bg;
+  const label = new Int32Array(n);
+  const stack = new Int32Array(n);
+  const gaps = [];
+  const match = (i) => {
+    if (alpha[i] === 0) return false; // already removed
+    const o = i * 4;
+    const dr = src[o] - B0, dg = src[o + 1] - B1, db = src[o + 2] - B2;
+    return dr * dr + dg * dg + db * db <= t2;
+  };
+  let id = 0;
+  for (let s = 0; s < n; s++) {
+    if (label[s] || !match(s)) continue;
+    id++;
+    let sp = 0, area = 0;
+    label[s] = id; stack[sp++] = s;
+    while (sp) {
+      const i = stack[--sp];
+      area++;
+      const x = i % w;
+      if (x > 0 && !label[i - 1] && match(i - 1)) { label[i - 1] = id; stack[sp++] = i - 1; }
+      if (x < w - 1 && !label[i + 1] && match(i + 1)) { label[i + 1] = id; stack[sp++] = i + 1; }
+      if (i >= w && !label[i - w] && match(i - w)) { label[i - w] = id; stack[sp++] = i - w; }
+      if (i < n - w && !label[i + w] && match(i + w)) { label[i + w] = id; stack[sp++] = i + w; }
+    }
+    if (area >= minArea) gaps.push({ id, seed: s, area });
+  }
+  return { label, gaps };
+}
+
 function clamp255(v) { return v < 0 ? 0 : v > 255 ? 255 : Math.round(v); }
 
 // Read a mask image (from the AI model) at the exact size of the photo.

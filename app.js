@@ -1,4 +1,4 @@
-import { detectBackground, borderIndices, floodCut, maskFromBlob, refineMask } from './imaging.js';
+import { detectBackground, borderIndices, floodCut, findGaps, maskFromBlob, refineMask } from './imaging.js';
 import { encodePNG } from './png.js';
 
 const AI_LIB = 'https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.7.0/+esm';
@@ -98,12 +98,31 @@ function compose(mode, aiAlpha) {
   const alpha = new Uint8Array(n);
   for (let i = 0; i < n; i++) alpha[i] = src[i * 4 + 3];
 
+  state.gapInfo = null;
   if (mode === 'flat') {
     floodCut(src, out, alpha, w, h, borderIndices(w, h), state.bg.color, tol);
+    if ($('gaps').checked) {
+      const minArea = Math.max(200, Math.round(n * 0.0008)); // ~1800px on a 1500×1500 image
+      const info = findGaps(src, w, h, state.bg.color, alpha, Math.min(tol, 20), minArea);
+      const kept = new Set(state.clicks.filter((c) => c.keep).map((c) => info.label[c.i]));
+      let removed = 0;
+      for (const g of info.gaps) {
+        if (kept.has(g.id)) continue;
+        floodCut(src, out, alpha, w, h, [g.seed], state.bg.color, tol);
+        removed++;
+      }
+      info.removed = new Set(info.gaps.filter((g) => !kept.has(g.id)).map((g) => g.id));
+      state.gapInfo = info;
+      $('gapNote').textContent = removed
+        ? `Removed ${removed} enclosed gap${removed > 1 ? 's' : ''}. Click one to bring it back.`
+        : kept.size ? 'Kept the gaps you clicked.' : '';
+    } else {
+      $('gapNote').textContent = '';
+    }
   } else {
     for (let i = 0; i < n; i++) alpha[i] = Math.round((alpha[i] * aiAlpha[i]) / 255);
   }
-  for (const c of state.clicks) floodCut(src, out, alpha, w, h, [c.i], c.color, tol);
+  for (const c of state.clicks) if (!c.keep) floodCut(src, out, alpha, w, h, [c.i], c.color, tol);
 
   for (let i = 0; i < n; i++) out[i * 4 + 3] = alpha[i];
   state.resultImage = new ImageData(out, w, h);
@@ -197,7 +216,16 @@ function updateClickButtons() {
 
 function showBusy(text) { $('busyText').textContent = text; $('busy').hidden = false; }
 function hideBusy() { $('busy').hidden = true; }
-function nextFrame() { return new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0))); }
+// Let the "Working…" overlay paint before heavy work. Falls back to a timer,
+// because hidden tabs never fire animation frames.
+function nextFrame() {
+  return new Promise((r) => {
+    let done = false;
+    const go = () => { if (!done) { done = true; setTimeout(r, 0); } };
+    requestAnimationFrame(go);
+    setTimeout(go, 50);
+  });
+}
 
 function toastError(msg) {
   let t = document.querySelector('.toast');
@@ -240,6 +268,7 @@ $('mode').addEventListener('click', (e) => {
 });
 $('model').addEventListener('change', run);
 $('refine').addEventListener('change', run);
+$('gaps').addEventListener('change', run);
 
 let tolTimer;
 $('tol').addEventListener('input', () => {
@@ -255,8 +284,14 @@ view.addEventListener('click', (e) => {
   const y = Math.floor(((e.clientY - r.top) / r.height) * state.h);
   if (x < 0 || y < 0 || x >= state.w || y >= state.h) return;
   const i = y * state.w + x, o = i * 4;
-  if (state.resultImage.data[o + 3] === 0) return; // already removed
-  state.clicks.push({ i, color: [state.src[o], state.src[o + 1], state.src[o + 2]] });
+  if (state.resultImage.data[o + 3] === 0) {
+    // Clicking a gap that was removed automatically brings it back.
+    const g = state.gapInfo;
+    if (!g || !g.removed.has(g.label[i])) return;
+    state.clicks.push({ i, keep: true });
+  } else {
+    state.clicks.push({ i, color: [state.src[o], state.src[o + 1], state.src[o + 2]] });
+  }
   updateClickButtons();
   run();
 });

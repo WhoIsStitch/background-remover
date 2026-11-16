@@ -14,7 +14,7 @@ A fast background remover that runs entirely in your browser. Nothing is uploade
 - **AI**: for photos. It uses [IMG.LY background-removal](https://github.com/imgly/background-removal-js) (AGPL), running locally with WebGPU when available. The model downloads once (44–88 MB) and is then cached. An optional guided filter snaps the mask edges to the photo.
 - **Auto** checks the image border and picks the right method.
 
-Click any leftover patch (for example a gap between an arm and the body) to remove it as well.
+Enclosed background gaps (like the space between an arm and the body) are removed automatically; small white details such as eye whites are kept. Click a removed gap to bring it back, or click any leftover patch to remove it.
 
 ## Run locally
 ```
