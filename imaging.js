@@ -1,11 +1,13 @@
 // Image maths. Everything works on the full-resolution pixels; nothing is resized.
 //
-// Pipeline (see app.js compose()):
-//   1. floodRegion  – track the background in from the image edges
-//   2. findGaps     – enclosed patches of background colour (+ user clicks)
-//   3. applyStrokes – optional Keep/Remove brush marks, solved with a
-//                     marker-controlled watershed along the strongest edges
-//   4. unmixEdges   – soft, halo-free edges on the final boundary
+// Two automatic methods:
+//   Colour  - floodRegion (track the background in from the edges) + findGaps
+//             (enclosed patches); edges finished with unmixEdges. Exact for art.
+//   Subject - grabCut (colour models + graph cut, maxflow.js); edges finished
+//             with matteEdges (soft, for photos, hair and fur).
+// Touch-ups: regionAt (Select tool), applyStrokes (brush watershed), shrinkEdge.
+
+import { gridMaxflow } from './maxflow.js';
 
 // ---------- Background colour ----------
 
@@ -228,92 +230,160 @@ export function watershed(src, w, h, seeds, limit) {
   return lab;
 }
 
-// ---------- Automatic subject finder (GrabCut-style, no AI) ----------
+// ---------- Automatic subject finder: GrabCut (graph cut), no AI ----------
 
-// Separates the subject from a busy background inside `box` [x0, y0, x1, y1).
-// 1. Learn colour models: background from outside the box, subject from inside.
-// 2. Pixels whose colour is clearly subject-like or clearly background-like
-//    (and whose neighbours agree) become seeds.
-// 3. A watershed grows the seeds across the image until they meet along the
-//    strongest edges, i.e. the subject's outline.
-// 4. Re-learn the colour models from that result and repeat.
-// Finally, small specks that got labelled as subject are dropped.
-// hardOutside: pixels outside the box are always background (Box tool).
-// Without it (automatic mode), the border strip only informs the colour model.
-export function subjectCut(src, w, h, box, hardOutside) {
+// Separates the subject from a busy background.
+// It balances two things over the whole image at once:
+//   - colour: does this pixel look like the subject's colours or the background's?
+//   - edges:  cutting between two similar neighbours is expensive, cutting
+//             along a strong edge is cheap.
+// The best balance is found exactly with a min-cut (maxflow.js). Colour
+// models are then re-learned from the result and the cut repeated.
+// It runs on a reduced copy for speed (about 0.3 MP); the outline is then
+// re-traced at full resolution so no detail is lost.
+//
+// opts.box   [x0, y0, x1, y1): where the subject is.
+// opts.hard  pixels outside the box are definitely background (Box tool).
+// opts.marks optional Uint8Array (1 = keep, 2 = remove): definite answers.
+// Returns isBg (Uint8Array, full resolution).
+export function grabCut(src, w, h, opts) {
+  const { box, hard, marks } = opts;
   const n = w * h;
-  const [bx0, by0, bx1, by1] = box;
-  const inBox = new Uint8Array(n);
-  for (let y = by0; y < by1; y++) inBox.fill(1, y * w + bx0, y * w + bx1);
-  const bin = new Uint16Array(n);
-  for (let i = 0; i < n; i++) {
-    const o = i * 4;
-    bin[i] = ((src[o] >> 4) << 8) | ((src[o + 1] >> 4) << 4) | (src[o + 2] >> 4);
+  const f = Math.max(1, Math.ceil(Math.sqrt(n / 300000)));
+  const sw = Math.ceil(w / f), sh = Math.ceil(h / f), sn = sw * sh;
+
+  // Reduced copy (block average) and reduced marks.
+  const img = new Float32Array(sn * 3), cnt = new Float32Array(sn);
+  const keepN = marks ? new Uint16Array(sn) : null, remN = marks ? new Uint16Array(sn) : null;
+  for (let y = 0; y < h; y++) {
+    const row = ((y / f) | 0) * sw;
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x, j = row + ((x / f) | 0), o = i * 4;
+      img[j * 3] += src[o]; img[j * 3 + 1] += src[o + 1]; img[j * 3 + 2] += src[o + 2]; cnt[j]++;
+      if (marks) { if (marks[i] === 1) keepN[j]++; else if (marks[i] === 2) remN[j]++; }
+    }
+  }
+  const sbin = new Uint16Array(sn);
+  for (let j = 0; j < sn; j++) {
+    const r = img[j * 3] /= cnt[j], g = img[j * 3 + 1] /= cnt[j], b = img[j * 3 + 2] /= cnt[j];
+    sbin[j] = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+  }
+  const sx0 = Math.floor(box[0] / f), sy0 = Math.floor(box[1] / f), sx1 = Math.ceil(box[2] / f), sy1 = Math.ceil(box[3] / f);
+  const inBox = new Uint8Array(sn);
+  for (let y = sy0; y < sy1; y++) inBox.fill(1, y * sw + sx0, y * sw + sx1);
+  const smark = new Uint8Array(sn);
+  if (marks) for (let j = 0; j < sn; j++) smark[j] = keepN[j] > remN[j] ? 1 : remN[j] ? 2 : 0;
+
+  // Edge costs: high between similar neighbours, low across strong edges.
+  const d2 = (a, b) => {
+    const dr = img[a * 3] - img[b * 3], dg = img[a * 3 + 1] - img[b * 3 + 1], db = img[a * 3 + 2] - img[b * 3 + 2];
+    return dr * dr + dg * dg + db * db;
+  };
+  let sum = 0, cntE = 0;
+  for (let j = 0; j < sn; j++) {
+    const x = j % sw;
+    if (x < sw - 1) { sum += d2(j, j + 1); cntE++; }
+    if (j < sn - sw) { sum += d2(j, j + sw); cntE++; }
+  }
+  const beta = 1 / (2 * (sum / Math.max(1, cntE)) + 1e-6);
+  const GAMMA = 50, SCALE = 8, HARD = 1 << 24;
+  const ecap = new Int32Array(sn * 4);
+  for (let j = 0; j < sn; j++) {
+    const x = j % sw;
+    if (x < sw - 1) { const c = Math.round(SCALE * GAMMA * Math.exp(-beta * d2(j, j + 1))); ecap[j * 4] = c; ecap[(j + 1) * 4 + 1] = c; }
+    if (j < sn - sw) { const c = Math.round(SCALE * GAMMA * Math.exp(-beta * d2(j, j + sw))); ecap[j * 4 + 2] = c; ecap[(j + sw) * 4 + 3] = c; }
   }
 
-  let lab = new Uint8Array(n);
-  for (let i = 0; i < n; i++) lab[i] = inBox[i] ? 1 : 2;
+  let lab = new Uint8Array(sn);
+  for (let j = 0; j < sn; j++) lab[j] = smark[j] ? (smark[j] === 1 ? 1 : 0) : inBox[j];
 
-  const T = 1.0; // log-likelihood ratio needed to be a seed
-  const ratio = new Float32Array(4096);
-  const cand = new Uint8Array(n);
-  const seeds = new Uint8Array(n);
-  for (let iter = 0; iter < 4; iter++) {
-    // Colour models (16 levels per channel), blurred so near colours count too.
+  // Colour models: blurred colour histograms (16 levels per channel),
+  // re-learned from the result on every round.
+  const tcap = new Int32Array(sn);
+  for (let iter = 0; iter < 5; iter++) {
     const hf = new Float32Array(4096), hb = new Float32Array(4096);
-    let nf = 0, nb = 0;
-    for (let i = 0; i < n; i++) {
-      if (lab[i] === 1) { hf[bin[i]]++; nf++; } else { hb[bin[i]]++; nb++; }
+    for (let j = 0; j < sn; j++) (lab[j] ? hf : hb)[sbin[j]]++;
+    const pf = probs(blurHist(hf)), pb = probs(blurHist(hb));
+    for (let j = 0; j < sn; j++) {
+      let t;
+      if (smark[j] === 1) t = HARD;
+      else if (smark[j] === 2 || (hard && !inBox[j])) t = -HARD;
+      else {
+        t = Math.round(SCALE * (Math.log(pf[sbin[j]]) - Math.log(pb[sbin[j]])));
+        if (!inBox[j]) t -= SCALE * 2; // soft border strip leans to background
+      }
+      tcap[j] = t;
     }
-    const sf = blurHist(hf), sb = blurHist(hb);
-    for (let k = 0; k < 4096; k++) ratio[k] = Math.log((sf[k] / (nf || 1) + 1e-7) / (sb[k] / (nb || 1) + 1e-7));
-
-    for (let i = 0; i < n; i++) {
-      if (hardOutside && !inBox[i]) { cand[i] = 2; continue; }
-      const r = ratio[bin[i]];
-      cand[i] = r > T ? 1 : r < -T ? 2 : 0;
-    }
-    // A seed needs its 4 neighbours to agree (removes noise).
-    let fgSeeds = 0;
-    for (let i = 0; i < n; i++) {
-      const c = cand[i];
-      seeds[i] = 0;
-      if (!c) continue;
-      const x = i % w;
-      if ((x > 0 && cand[i - 1] !== c) || (x < w - 1 && cand[i + 1] !== c) ||
-          (i >= w && cand[i - w] !== c) || (i < n - w && cand[i + w] !== c)) continue;
-      seeds[i] = c;
-      if (c === 1) fgSeeds++;
-    }
-    if (!fgSeeds) break; // nothing looks like a subject: keep the last result
-    const next = watershed(src, w, h, seeds, 443);
-    for (let i = 0; i < n; i++) if (!next[i]) next[i] = lab[i];
+    const next = gridMaxflow(sw, sh, tcap, ecap.slice()).label;
+    let changed = 0;
+    for (let j = 0; j < sn; j++) if (next[j] !== lab[j]) changed++;
     lab = next;
+    if (changed < sn * 0.001) break;
   }
 
-  // Drop subject specks smaller than 1% of the biggest subject piece.
-  const comp = new Int32Array(n), stack = new Int32Array(n), sizes = [0];
+  dropSpecks(lab, sw, sh, smark);
+
+  // Back to full resolution: pixels near the reduced outline are re-traced
+  // along the real edges (watershed); everything else takes its block's answer.
+  const isBg = new Uint8Array(n);
+  if (f === 1) {
+    for (let i = 0; i < n; i++) isBg[i] = lab[i] ? 0 : 1;
+  } else {
+    const edgeBlock = new Uint8Array(sn);
+    for (let j = 0; j < sn; j++) {
+      const x = j % sw, l = lab[j];
+      if ((x > 0 && lab[j - 1] !== l) || (x < sw - 1 && lab[j + 1] !== l) || (j >= sw && lab[j - sw] !== l) || (j < sn - sw && lab[j + sw] !== l)) edgeBlock[j] = 1;
+    }
+    const seeds = new Uint8Array(n);
+    for (let y = 0; y < h; y++) {
+      const row = ((y / f) | 0) * sw;
+      for (let x = 0; x < w; x++) {
+        const j = row + ((x / f) | 0), i = y * w + x;
+        if (!edgeBlock[j]) seeds[i] = lab[j] ? 1 : 2;
+        if (marks && marks[i]) seeds[i] = marks[i];
+      }
+    }
+    const traced = watershed(src, w, h, seeds, 443);
+    for (let i = 0; i < n; i++) isBg[i] = traced[i] === 1 ? 0 : 1;
+  }
+  if (marks) for (let i = 0; i < n; i++) if (marks[i]) isBg[i] = marks[i] === 2 ? 1 : 0;
+  return isBg;
+}
+
+function probs(hist) {
+  const m = hist.length;
+  let total = 0;
+  for (let k = 0; k < m; k++) total += hist[k];
+  const p = new Float32Array(m), a = 0.5, den = total + a * m;
+  for (let k = 0; k < m; k++) p[k] = (hist[k] + a) / den;
+  return p;
+}
+
+
+// Remove subject pieces smaller than 1% of the biggest (unless the user marked them).
+function dropSpecks(lab, w, h, keepMarks) {
+  const n = w * h;
+  const comp = new Int32Array(n), stack = new Int32Array(n), sizes = [0], marked = [false];
   let id = 0;
   for (let s = 0; s < n; s++) {
     if (lab[s] !== 1 || comp[s]) continue;
     id++;
-    let sp = 0, area = 0;
+    let sp = 0, area = 0, mk = false;
     comp[s] = id; stack[sp++] = s;
     while (sp) {
       const i = stack[--sp]; area++;
+      if (keepMarks[i] === 1) mk = true;
       const x = i % w;
       if (x > 0 && lab[i - 1] === 1 && !comp[i - 1]) { comp[i - 1] = id; stack[sp++] = i - 1; }
       if (x < w - 1 && lab[i + 1] === 1 && !comp[i + 1]) { comp[i + 1] = id; stack[sp++] = i + 1; }
       if (i >= w && lab[i - w] === 1 && !comp[i - w]) { comp[i - w] = id; stack[sp++] = i - w; }
       if (i < n - w && lab[i + w] === 1 && !comp[i + w]) { comp[i + w] = id; stack[sp++] = i + w; }
     }
-    sizes.push(area);
+    sizes.push(area); marked.push(mk);
   }
   let biggest = 0;
   for (const a of sizes) if (a > biggest) biggest = a;
-  const isBg = new Uint8Array(n);
-  for (let i = 0; i < n; i++) isBg[i] = lab[i] === 1 && sizes[comp[i]] >= biggest * 0.01 ? 0 : 1;
-  return isBg;
+  for (let i = 0; i < n; i++) if (lab[i] === 1 && sizes[comp[i]] < biggest * 0.01 && !marked[comp[i]]) lab[i] = 0;
 }
 
 function blurHist(hist) {
@@ -476,3 +546,83 @@ export function unmixEdges(src, out, alpha, w, h, isBg, ref, tol) {
 }
 
 function clamp255(v) { return v < 0 ? 0 : v > 255 ? 255 : Math.round(v); }
+
+// ---------- Soft edges for photos (sampling-based matting) ----------
+
+// For photos, hair and fur: every pixel within `radius` px of the outline gets
+// a real partial transparency. Around each one we sample candidate subject
+// colours (F) and background colours (B) a little further out along 8
+// directions, pick the pair that best explains the pixel as a mix
+// P = a*F + (1-a)*B, and use that a. The background is then taken out of the
+// pixel's colour. Pixels further inside keep their exact original values.
+export function matteEdges(src, out, alpha, w, h, isBg, radius) {
+  const n = w * h;
+  const FAR = radius + 6;
+  // Distance (in steps) to the outline, up to FAR.
+  const dist = new Uint8Array(n).fill(255);
+  const queue = new Int32Array(n);
+  let qh = 0, qt = 0;
+  for (let i = 0; i < n; i++) {
+    const x = i % w, b = isBg[i];
+    if ((x > 0 && isBg[i - 1] !== b) || (x < w - 1 && isBg[i + 1] !== b) || (i >= w && isBg[i - w] !== b) || (i < n - w && isBg[i + w] !== b)) {
+      dist[i] = 0; queue[qt++] = i;
+    }
+  }
+  while (qh < qt) {
+    const i = queue[qh++], d = dist[i] + 1;
+    if (d > FAR) continue;
+    const x = i % w;
+    if (x > 0 && dist[i - 1] > d) { dist[i - 1] = d; queue[qt++] = i - 1; }
+    if (x < w - 1 && dist[i + 1] > d) { dist[i + 1] = d; queue[qt++] = i + 1; }
+    if (i >= w && dist[i - w] > d) { dist[i - w] = d; queue[qt++] = i - w; }
+    if (i < n - w && dist[i + w] > d) { dist[i + w] = d; queue[qt++] = i + w; }
+  }
+
+  const DX = [1, 1, 0, -1, -1, -1, 0, 1], DY = [0, 1, 1, 1, 0, -1, -1, -1];
+  const F = new Int32Array(8), B = new Int32Array(8);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      if (dist[i] > radius) { if (isBg[i]) alpha[i] = 0; continue; }
+      // Collect samples: first confident pixel of each kind along each ray.
+      let nf = 0, nb = 0;
+      for (let r = 0; r < 8; r++) {
+        let gotF = false, gotB = false;
+        for (let s = 1; s <= FAR + radius && !(gotF && gotB); s++) {
+          const xx = x + DX[r] * s, yy = y + DY[r] * s;
+          if (xx < 0 || yy < 0 || xx >= w || yy >= h) break;
+          const j = yy * w + xx;
+          if (dist[j] <= radius) continue;
+          if (isBg[j]) { if (!gotB) { B[nb++] = j; gotB = true; } }
+          else if (!gotF) { F[nf++] = j; gotF = true; }
+        }
+      }
+      const o = i * 4;
+      if (!nf || !nb) { if (isBg[i]) alpha[i] = 0; continue; }
+      const P0 = src[o], P1 = src[o + 1], P2 = src[o + 2];
+      let bestErr = Infinity, bestA = 0, bB = 0;
+      for (let a = 0; a < nf; a++) {
+        const fo = F[a] * 4;
+        for (let b = 0; b < nb; b++) {
+          const bo = B[b] * 4;
+          const f0 = src[fo] - src[bo], f1 = src[fo + 1] - src[bo + 1], f2 = src[fo + 2] - src[bo + 2];
+          const ff = f0 * f0 + f1 * f1 + f2 * f2;
+          if (ff < 400) continue; // subject and background too alike here
+          const v0 = P0 - src[bo], v1 = P1 - src[bo + 1], v2 = P2 - src[bo + 2];
+          let al = (v0 * f0 + v1 * f1 + v2 * f2) / ff;
+          al = al < 0 ? 0 : al > 1 ? 1 : al;
+          const r0 = v0 - al * f0, r1 = v1 - al * f1, r2 = v2 - al * f2;
+          const err = (r0 * r0 + r1 * r1 + r2 * r2) / ff; // relative to how far apart F and B are
+          if (err < bestErr) { bestErr = err; bestA = al; bB = bo; }
+        }
+      }
+      if (bestErr === Infinity) { if (isBg[i]) alpha[i] = 0; continue; }
+      if (bestA > 0.97) continue; // solid: keep the exact original pixel
+      if (bestA < 0.03) { alpha[i] = 0; continue; }
+      out[o] = clamp255(src[bB] + (P0 - src[bB]) / bestA);
+      out[o + 1] = clamp255(src[bB + 1] + (P1 - src[bB + 1]) / bestA);
+      out[o + 2] = clamp255(src[bB + 2] + (P2 - src[bB + 2]) / bestA);
+      alpha[i] = Math.round(bestA * src[o + 3]);
+    }
+  }
+}

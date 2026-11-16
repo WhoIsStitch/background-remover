@@ -1,5 +1,5 @@
 import {
-  detectBackground, backgroundSeeds, floodRegion, findGaps, subjectCut,
+  detectBackground, backgroundSeeds, floodRegion, findGaps, grabCut, matteEdges,
   regionAt, applyStrokes, shrinkEdge, unmixEdges,
 } from './imaging.js';
 import { encodePNG } from './png.js';
@@ -114,8 +114,20 @@ async function run() {
   $('info').textContent = `${state.w} × ${state.h}px · ${ms < 1000 ? ms + ' ms' : (ms / 1000).toFixed(1) + ' s'}`;
 }
 
+function strokesOf() { return state.actions.filter((a) => a.kind === 'stroke'); }
+
 function baseKey(p) {
-  return [p.method, p.box, p.hard, $('tol').value, $('gaps').checked].join('|');
+  // In Subject mode the brush strokes are part of the graph cut itself.
+  const strokes = p.method === 'subject' ? strokesOf().length : 0;
+  return [p.method, p.box, p.hard, $('tol').value, $('gaps').checked, strokes].join('|');
+}
+
+function strokeMarks() {
+  const strokes = strokesOf();
+  if (!strokes.length) return null;
+  const marks = new Uint8Array(state.w * state.h);
+  for (const s of strokes) rasterStroke(marks, state.w, state.h, s);
+  return marks;
 }
 
 // The automatic cut. Cached, so touch-ups are quick.
@@ -135,7 +147,7 @@ function getBase(p) {
       if (removedGaps) floodRegion(src, w, h, info.gaps.map((g) => g.seed), tol, isBg, ref);
     }
   } else {
-    isBg = subjectCut(src, w, h, p.box, p.hard);
+    isBg = grabCut(src, w, h, { box: p.box, hard: p.hard, marks: strokeMarks() });
     for (let i = 0; i < n; i++) if (isBg[i]) { ref[i * 3] = src[i * 4]; ref[i * 3 + 1] = src[i * 4 + 1]; ref[i * 3 + 2] = src[i * 4 + 2]; }
   }
   state.base = { isBg, ref, removedGaps };
@@ -162,22 +174,23 @@ function compose(p) {
     }
   }
 
-  // Keep / Remove brush strokes.
-  const strokes = state.actions.filter((a) => a.kind === 'stroke');
-  if (strokes.length) {
-    const marks = new Uint8Array(n);
-    for (const s of strokes) rasterStroke(marks, w, h, s);
-    applyStrokes(src, w, h, isBg, ref, marks);
+  // Keep / Remove brush strokes (Colour mode; in Subject mode they are
+  // already part of the graph cut).
+  if (p.method === 'colour') {
+    const marks = strokeMarks();
+    if (marks) applyStrokes(src, w, h, isBg, ref, marks);
   }
 
   const trim = +$('shrink').value;
   if (trim) shrinkEdge(src, w, h, isBg, ref, trim);
 
-  // Soft, halo-free edges; everything else keeps its original pixels.
+  // Edges: exact un-mixing for art (Colour), soft matting for photos (Subject).
+  // Everything away from the edge keeps its original pixels.
   const out = new Uint8ClampedArray(src);
   const alpha = new Uint8Array(n);
   for (let i = 0; i < n; i++) alpha[i] = src[i * 4 + 3];
-  unmixEdges(src, out, alpha, w, h, isBg, ref, tol);
+  if (p.method === 'subject') matteEdges(src, out, alpha, w, h, isBg, 2);
+  else unmixEdges(src, out, alpha, w, h, isBg, ref, tol);
   for (let i = 0; i < n; i++) out[i * 4 + 3] = alpha[i];
   state.resultImage = new ImageData(out, w, h);
 

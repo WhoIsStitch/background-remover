@@ -12,7 +12,7 @@ A fast background remover that runs entirely in your browser. No AI and no uploa
 ## Automatic methods
 **Auto** picks one of these for you:
 - **Colour:** for art, logos and anything on a solid or smoothly changing background. The cut starts at the image edges and tracks the background colour inward, following gradients and soft shadows but stopping at outlines. Enclosed gaps, such as the space between an arm and the body or a sliver between strands of hair, are removed too. Eye whites and near-white skin are kept.
-- **Subject:** for busy backgrounds like photos and game screenshots. It works like GrabCut, without AI. It learns which colours belong to the background and which to the subject, plants seeds where it's sure, and grows them with a watershed until they meet at the strongest edge, the outline. It repeats this to refine the result, then drops stray specks.
+- **Subject:** for busy backgrounds like photos and game screenshots. It uses GrabCut, without AI. Colour models for subject and background are weighed against edge strength over the whole image, and the best cut is found exactly with a min-cut/max-flow solver (`maxflow.js`, Boykov–Kolmogorov). It repeats this with refined colour models, then re-traces the outline at full resolution. Edges get soft matting: each edge pixel picks the best subject/background colour pair around it, so hair and fur get real partial transparency. Keep/Remove strokes become hard constraints in the cut.
 
 ## Tools
 | Tool | Key | What it does |
